@@ -128,7 +128,10 @@ baseDir="/root/loot/slipperypickle"
 liveWifi=true              # include WiFi devices from recon.db (needs PineAP Recon running)
 liveBle=true               # include BT/BLE from blue5.db (PineAP's BT daemon; we never scan)
 scanEvery=2                # seconds between background DB-read passes
-renderEvery=2              # seconds between list redraws (lower=more live, more scroll)
+renderEvery=2              # loop tick: how often the radar re-checks the live set (seconds)
+heartbeat=4                # force a refresh at least this often even if nothing changed, so the
+                           #   view keeps auto-scrolling (higher=less log growth, raise if it
+                           #   ever gets sluggish over a long session; the payload log is append-only)
 stale=120                   # keep a device shown for 2 min (longer than one scan pass)
 maxRows=12                  # device rows shown
 # --- Compare / correlation (used by "Compare snapshots") ---
@@ -271,15 +274,15 @@ liveSnapshotRows() {
 
 # Background: redraw the list every renderEvery seconds
 bgRenderer() {
-    local rows sig mac src lbl bar disp tag rb sigkey lastSig="__init__"
+    local rows sig mac src lbl bar disp tag rb sigkey lastSig="__init__" lastEmit=0 now
     while :; do
         if [ -f "$pause" ]; then sleep 0.4; continue; fi
         rows=$(liveSnapshotRows | head -n "$maxRows")
         # The payload LOG is an append-only log with NO screen-clear, and every LOG call forks
-        # hak5cmd, so repainting a full frame every tick floods the log and pins the CPU (this is
-        # what made the output stop scrolling / go sluggish over time). Instead, only repaint when
-        # the VISIBLE list changes. The change-signature buckets RSSI to ~10 dB (integer divide,
-        # no subprocess) so ordinary signal jitter does not count as a change.
+        # hak5cmd, so repainting a full frame every tick floods the log and pins the CPU (that is
+        # what made it go sluggish over time). We repaint when the VISIBLE list changes OR once per
+        # heartbeat (so the view keeps auto-scrolling when idle). The change-signature buckets RSSI
+        # to ~10 dB (integer divide, no subprocess) so ordinary signal jitter is not a change.
         sigkey=""
         while IFS='|' read -r sig mac src lbl; do
             [ -z "$mac" ] && continue
@@ -289,8 +292,11 @@ bgRenderer() {
         done <<RENDEREOF
 $rows
 RENDEREOF
-        if [ "$sigkey" = "$lastSig" ]; then sleep "$renderEvery"; continue; fi
-        lastSig="$sigkey"
+        now=$(date +%s)
+        if [ "$sigkey" = "$lastSig" ] && [ $(( now - lastEmit )) -lt "$heartbeat" ]; then
+            sleep "$renderEvery"; continue
+        fi
+        lastSig="$sigkey"; lastEmit="$now"
         # Emit one compact frame: header (delimits frames) + rows, NO blank-line padding
         # (padding only adds lines to an append-only log, it clears nothing).
         LOG cyan "v$version $(bandStats)"
@@ -449,6 +455,10 @@ showDeviceDetailLive() {
             if(bleco=="Samsung"|| ven ~ /Samsung/)            guess="Samsung / Android";
             if(bleco=="Google" || ven ~ /Google/)             guess="Google / Android";
             if(bleco ~ /Xiaomi/|| ven ~ /Xiaomi|Mijia|Huami|Amazfit/) guess="Xiaomi / Android";
+            if(bleco ~ /OnePlus|Oppo|Vivo|Realme|Nubia|ZTE|Honor|Meizu|Lenovo|Motorola|Transsion/) guess=bleco " / Android";
+            else if(bleco ~ /Nothing|Nokia|LG|HTC|TCL|Alcatel|Fairphone|Asus|BlackBerry|Vertu|Yota|Gigaset/) guess=bleco " / Android";
+            else if(bleco ~ /Jolla/) guess="Jolla / Sailfish";
+            else if(ven ~ /OnePlus|Oppo|Vivo|Realme|Nubia|ZTE|HONOR|Meizu|Lenovo|Motorola|Nothing|Fairphone|Alcatel|BlackBerry|Gigaset|Vertu|Asustek|HTC|TCL/) guess="Android (OEM)";
             if(ven!="")   printf "Vendor: %s\n", ven;
             if(guess!="") printf "Likely: %s\n", guess;
             if(bleco!=""||blen!="") printf "BLE: %s %s\n", bleco, blen;
@@ -701,6 +711,16 @@ BEGIN{
   close(OUIFILE)
   comp["76"]="Apple"; comp["117"]="Samsung"; comp["224"]="Google"; comp["6"]="Microsoft"
   comp["637"]="Huawei"; comp["343"]="Xiaomi/Huami"; comp["911"]="Xiaomi"; comp["301"]="Sony"; comp["89"]="Nordic"
+  # Chinese Android OEM BLE company IDs (Bluetooth SIG assigned numbers). RedMagic = Nubia;
+  # Redmi has no own ID (it is Xiaomi, 911). Tecno/Infinix/itel share Transsion.
+  comp["1839"]="OnePlus"; comp["1946"]="Oppo"; comp["2103"]="Vivo"; comp["2212"]="Realme"
+  comp["2250"]="Nubia"; comp["2392"]="ZTE"; comp["2502"]="Honor"; comp["3790"]="Honor"
+  comp["939"]="Meizu"; comp["709"]="Lenovo"; comp["1260"]="Motorola"; comp["8"]="Motorola"; comp["2370"]="Transsion"
+  # Other handset makers (SIG company IDs). Mostly Android; Jolla = Sailfish; legacy IDs kept too.
+  comp["3275"]="Nothing"; comp["3267"]="HMD/Nokia"; comp["1"]="Nokia"; comp["196"]="LG"; comp["749"]="HTC"
+  comp["3014"]="TCL"; comp["36"]="Alcatel"; comp["4298"]="Fairphone"; comp["3649"]="Asus"; comp["60"]="BlackBerry"
+  comp["481"]="Jolla"; comp["86"]="SonyEricsson"; comp["162"]="Vertu"; comp["982"]="Yota"; comp["384"]="Gigaset"
+  comp["398"]="Google"
   FS="|"; lc=0
 }
 $1=="FLUSH"{
@@ -772,6 +792,9 @@ function osfam(ven,bleco,model){
   if(bleco=="Google"||ven~/Google/||model~/FastPair/) return "Android"
   if(bleco=="Huawei"||ven~/[Hh]uawei|HONOR/||model~/Huawei/) return "HarmonyOS"
   if(bleco~/Xiaomi/||ven~/Xiaomi|Mijia|Huami|Amazfit/||model~/Xiaomi/) return "Android(Xia)"
+  if(bleco~/OnePlus|Oppo|Vivo|Realme|Nubia|ZTE|Honor|Meizu|Lenovo|Motorola|Transsion/||ven~/OnePlus|Oppo|Vivo|Realme|Nubia|ZTE|Meizu|Lenovo|Motorola/) return "Android"
+  if(bleco~/Nothing|Nokia|LG|HTC|TCL|Alcatel|Fairphone|Asus|BlackBerry|Vertu|Yota|Gigaset/||ven~/Nothing|Nokia|Fairphone|Alcatel|BlackBerry|Gigaset|Vertu|Yota|Asustek|HTC|TCL/) return "Android"
+  if(bleco~/Jolla/||ven~/Jolla/) return "Sailfish"
   return ""
 }
 BEGIN{FS="\t"}

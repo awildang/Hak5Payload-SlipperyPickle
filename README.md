@@ -80,7 +80,7 @@ a passive monitor-mode sniff.
 | Radio / protocol | Bands | What SlipperyPickle uses |
 |------------------|-------|--------------------------|
 | **Wi-Fi — IEEE 802.11** | 2.4 GHz, 5 GHz, 6 GHz | From `recon.db`: client MAC, RSSI, frequency/band, and **probed-SSID lists (PNL)**. Stage 2 passively sniffs **probe-request** management frames for the **802.11 Information-Element fingerprint** and **sequence number**. |
-| **Bluetooth Low Energy (BLE)** | 2.4 GHz (advertising ch. 37/38/39) | From `blue5.db`: advertised **company ID**, device name, **randomized-vs-public address** flag (`le_random`), **manufacturer data** (Apple Continuity, Samsung, Huawei, Xiaomi/MIoT, Google Fast Pair) and **service UUIDs**. Stage 3 (opt-in) connects over **GATT**. |
+| **Bluetooth Low Energy (BLE)** | 2.4 GHz (advertising ch. 37/38/39) | From `blue5.db`: **company ID → vendor** (Apple, Samsung, Google, Microsoft, Huawei, Xiaomi, OnePlus, Oppo, vivo, Realme, Nubia/RedMagic, ZTE, Honor, Meizu, Lenovo/Motorola, Transsion, HMD/Nokia, Nothing, LG, HTC, TCL, Alcatel, Fairphone, Asus, BlackBerry, …), device name, **randomized-vs-public address** flag (`le_random`), **manufacturer-data device types** (Apple Continuity, Samsung, Huawei, Xiaomi/MIoT, Google Fast Pair) and **service UUIDs**. Stage 3 (opt-in) connects over **GATT**. |
 | **Bluetooth Classic (BR/EDR)** | 2.4 GHz | From `blue5.db`: device presence, company and name as recorded by the `blue5` daemon. |
 
 The live-radar header shows a per-band breakdown of what's currently in view (e.g. `2.4:60% 5:30%

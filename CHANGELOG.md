@@ -19,6 +19,11 @@ First public release candidate.
 - **BLE enrichment** — randomized-address flag (`le_random`) and device-type decoding from
   manufacturer/service data: Apple Continuity, Samsung, Huawei, Xiaomi/Mi (MIoT), Google Fast Pair
   (Becker et al., 2019; Martin et al., 2019; Celosia & Cunche, 2020; Zuo et al., 2019).
+- **Expanded BLE company-ID vendor labels** — in addition to the above, devices are now labelled by
+  Bluetooth SIG company ID for OnePlus, Oppo, vivo, Realme, Nubia (RedMagic), ZTE, Honor, Meizu,
+  Lenovo/Motorola and Transsion (Tecno/Infinix/itel); plus HMD/Nokia, Nothing, LG, HTC, TCL, Alcatel,
+  Fairphone, Asus, BlackBerry, Vertu, Yota, Gigaset and a second Google ID — all mapped to Android
+  (Jolla → Sailfish). (Redmi = Xiaomi; RedMagic = Nubia.)
 - **Active Stage 3 GATT probe** (opt-in) — reads Device Information and enumerates service UUIDs
   (Celosia & Cunche, 2019).
 - **Cross-radio Wi-Fi↔BT co-presence** pairing, reported as ranked low-confidence candidates

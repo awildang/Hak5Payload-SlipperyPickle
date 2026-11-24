@@ -23,7 +23,7 @@ hardware are documented here for completeness but are out of reach on this platf
 | 6 | **Extended Continuity artifacts** | Celosia & Cunche, *Discontinued Privacy: Personal Data Leaks in Apple BLE Continuity Protocols* | PoPETs 2020 (popets-2020-0003) | Stage 1 (partial). Informs the Continuity type decoding. Counters/battery artifacts are documented as a future enrichment (see below). |
 | 7 | **GATT service-UUID fingerprint** | Celosia & Cunche, *Fingerprinting BLE Devices Based on the Generic Attribute Profile* | ACM IoT S&P 2019 · DOI 10.1145/3338507.3358617 | Stage 3 (active, opt-in). Enumerates a device's primary GATT service UUIDs — a profile fingerprint that is stable across address rotation. |
 | 8 | **Cross-radio Wi-Fi↔BT co-presence** | Longo, Redondi & Cesana, *Pairing Wi-Fi and Bluetooth MAC Addresses Through Passive Packet Capture* | Med-Hoc-Net 2018 · HAL hal-01832528 | Compare step. Mutual-nearest-neighbour RSSI co-presence across snapshots produces low-confidence candidate pairings of one device's two radios. |
-| 9 | **Vendor / OS identification** | Bluetooth SIG Assigned Numbers; Huawei CloudCampus & HarmonyOS documentation | — | Stage 1. Company IDs and OUIs label devices (Apple / Samsung / Google / Huawei / Xiaomi / …). Used only to **label and gate** correlation, never as a match key (e.g. all Apple devices share one company ID). |
+| 9 | **Vendor / OS identification** | Bluetooth SIG Assigned Numbers; Huawei CloudCampus & HarmonyOS documentation | — | Stage 1. BLE company IDs and Wi-Fi OUIs label devices (Apple / Samsung / Google / Huawei / Xiaomi / OnePlus / Oppo / vivo / Realme / Nubia (RedMagic) / ZTE / Honor / Meizu / Lenovo-Motorola / Transsion / HMD-Nokia / Nothing / LG / HTC / TCL / Alcatel / Fairphone / Asus / BlackBerry / …). Used only to **label and gate** correlation, never as a match key (e.g. all Apple devices share one company ID). |
 | 10 | **Advertisement service-UUID identification** | Zuo, Wen, Lin & Zhang, *Automatic Fingerprinting of Vulnerable BLE IoT Devices with Static UUIDs from Mobile Apps* | ACM CCS 2019 · DOI 10.1145/3319535.3354240 | Stage 1. Advertised service UUIDs identify a device type without a connection. Basis for the **Xiaomi/Mi (Mijia/MIoT)** decode: BLE company ID `0x038F` and MIoT service UUID `0xFE95`, read passively from the Bluetooth daemon's `mfr`/`svcd` fields (same path as Apple/Samsung/Huawei/FastPair). |
 
 ---
@@ -59,6 +59,24 @@ as separate modules:
 | **Active behavioral 802.11 fingerprinting** | Bratus, Cornelius, Kotz & Peebles, *Active Behavioral Fingerprinting of Wireless Devices* | ACM WiSec 2008 — fingerprint a device by how it responds to crafted/malformed frames. Possible via frame injection but intrusive and unreliable; a candidate future active module (would gate on `activeFp`). |
 | **BTLEmap ("Nmap for BLE")** | Heinrich, Stute & Hollick | ACM WiSec 2020 (demo) — active BLE enumeration + GATT discovery; the reference design that Stage 3 mirrors. |
 | **Samsung Offline Finding analysis** | Yu, Henderson, Tiu & Haines, *Privacy Analysis of Samsung's Crowd-Sourced Bluetooth Location Tracking System* | USENIX Security 2024 · arXiv:2210.14702 — Samsung's equivalent of Apple Find My; context for recognizing Samsung tracker beacons in Stage 1. |
+
+## Probe-request fingerprinting (refinements to Stage 2)
+
+Recent work extends the 802.11 probe-request fingerprint we use in Stage 2. We do not implement
+these techniques (they need multi-channel capture and/or ML), but they bound what the IE signal can
+do and their datasets explicitly include Chinese-OEM handsets (OnePlus, Oppo, Redmi, Xiaomi):
+
+| Technique | Paper | Note |
+|-----------|-------|------|
+| **Compact IE fingerprints** | Pintor & Atzori, *Compact Probe Request Fingerprinting with Asymmetric Pairwise Boosting* | arXiv:2412.10548 (2024) — compresses probe-request IE fingerprints to <1% memory with comparable accuracy; dataset includes OnePlus/Oppo/Redmi/Xiaomi. |
+| **Timing-based de-randomization** | *MAC Address De-Randomization using Multi-Channel Sniffers and Two-Stage Clustering* | arXiv:2408.01578 (2024) — the time-frequency pattern of probe-request emission links rotated MACs. Needs multi-channel sniffers (we are single-channel). |
+| **State-transition identification** | *Effectively Identifying Wi-Fi Devices through State Transitions* | arXiv:2507.02478 (2025) — notes IE methods are weak when same-vendor devices share identical IEs and that firmware/OS updates shift fields; a caveat for our IE fingerprint. |
+| **BLE re-identification** | *Learning to Link: Automatic Re-identification of BLE Devices Under MAC Address Randomisation* | arXiv:2609.26079 (2026) — ML re-id of BLE under randomization; cites a 2025 ACM TOPS allowlist side-channel attack. |
+
+**Note on Chinese OEMs:** no brand-specific Wi-Fi/BT OS-fingerprinting paper exists — the literature
+treats OnePlus / Oppo / vivo / Realme / Nubia (RedMagic) / Redmi etc. as generic Android. The
+practical lever is therefore the vendor **identifiers** (row 9), not a new technique. Redmi has no
+own Bluetooth SIG ID (it is Xiaomi, `0x038F`); RedMagic is Nubia (`0x08CA`).
 
 ## Defensive side (context)
 

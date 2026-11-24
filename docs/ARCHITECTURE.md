@@ -62,6 +62,11 @@ On every snapshot, each live device is enriched with:
 - **Device type** — decoded from Bluetooth manufacturer/service data: Apple Continuity message types
   (Find My, Nearby, AirPods, Handoff, AirDrop, iBeacon), Samsung, Huawei, Xiaomi/Mi (MIoT),
   Google Fast Pair, etc.
+- **Vendor label** — the BLE company ID (and Wi-Fi OUI) resolves to a vendor name: Apple, Samsung,
+  Google, Microsoft, Huawei, Xiaomi, OnePlus, Oppo, vivo, Realme, Nubia (RedMagic), ZTE, Honor,
+  Meizu, Lenovo/Motorola, Transsion (Tecno/Infinix/itel), HMD/Nokia, Nothing, LG, HTC, TCL, Alcatel,
+  Fairphone, Asus, BlackBerry, and more. Most map to Android for the OS family (Jolla → Sailfish).
+  This only **labels/gates** — it is never a match key (all Apple share one ID).
 - **DHCP hostname** — for any device that has joined your access point.
 
 ### Stage 2 — passive 802.11 fingerprint
