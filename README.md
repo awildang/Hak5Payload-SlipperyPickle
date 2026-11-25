@@ -12,7 +12,7 @@ collect and passively sniffs the air. It does not transmit to or connect to any 
 device unless you explicitly enable active mode (see [Passive vs. active](#passive-vs-active)).
 It takes up to 10 seconds to start populating identifiers.
 
-> **Version:** `v20261122-rc1` (release candidate)
+> **Version:** `v20261124-rc1` (release candidate)
 
 ---
 
@@ -51,6 +51,14 @@ as groundwork for AntiHunter.
   (probed-SSID lists, BLE device type, 802.11 fingerprints, …), then clears the list.
 - **Compare** — correlates identities across all snapshots and flags the devices that keep
   reappearing (the same device recurring across snapshots), plus low-confidence cross-radio (Wi-Fi↔BT) pairings.
+- **Tracker tags** — recognises AirTags, Find My accessories, Samsung SmartTags, Tile, Chipolo,
+  Pebblebee, Google Find My Device tags and any tag using the Apple/Google tracker standard, and lists
+  the ones that recur across snapshots (tags away from their owner first). Rules follow the AirGuard
+  research app.
+- **Dwell & history** — Compare shows how long each identity was present this session (dwell) and
+  how many sessions it has been seen across (cross-session memory, auto-expiring after `histDays`).
+- **Known-device filtering** — mark your own/authorised devices (one menu press captures everything
+  currently around you) so they are hidden from results, leaving only the unknowns.
 - **Device detail** — per-device identifiers for manual analysis, including the 802.11 sequence
   number for confirming a MAC rotation by eye.
 
@@ -168,8 +176,14 @@ touch:
 | `matchThreshold` | `2` | Flag an identity seen in ≥ this many snapshots. |
 | `stale` | `120` | Seconds a device stays on the live list. |
 | `pnlCommon` | `6` | A probed SSID seen for more than this many identities is treated as "public" and ignored as an identity key. |
+| `fpCommon` | `4` | An 802.11 IE fingerprint shared by more than this many identities is treated as a common phone model/OS build and does not merge them. |
 | `rssiTol` | `10` | dBm tolerance for cross-radio co-presence. |
 | `liveIe` | `true` | Enable the Stage 2 passive 802.11 fingerprint sniff. |
+| `histDays` | `14` | Cross-session history forgets an identity not seen for this many days (auto-expiry). |
+
+The **known-devices list** and **cross-session history** persist in `loot/slipperypickle/known.txt`
+and `history.txt`. Populate the known list with **Learn known here**; wipe either store with
+**Clear saved data**. Neither needs a MAC typed by hand.
 
 ---
 

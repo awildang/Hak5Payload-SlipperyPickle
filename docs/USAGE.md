@@ -42,6 +42,8 @@ The menu is a single scrollable list titled **Main Menu**. If the list is taller
 | Start scan | Open the live radar (continuously refreshing device list). |
 | Take snapshot | Freeze and enrich the current device set, then clear the list. |
 | Compare snapshots | Correlate identities across all snapshots and produce the report. |
+| Learn known here | Add every device currently around you to the known/authorised list, so they are hidden from Compare. No MAC typing. |
+| Clear saved data | Wipe the cross-session history or the known-devices list (pick which). |
 | Stop & exit | Clean up and quit. |
 | Active mode: OFF / ON | Toggle active (Stage 3) fingerprinting for this session. The label shows the current state; enabling it asks for confirmation. |
 | Probe BT device (ACTIVE!) | *Only shown while active mode is ON* — Stage 3 GATT probe. |
@@ -59,6 +61,17 @@ detail** view for a highlighted device.
 
 ## Reading the report
 
+The recurring-identities table has two extra columns: **DWELL** (how long the device was present
+this session) and **HIST** (`new` = first time ever, `x2`/`x3`… = also seen in that many prior
+sessions). A line near the top reports how many **known/authorised** devices were hidden. To build
+that known list, stand where your own devices are and press **Learn known here**; to reset the
+stored data, use **Clear saved data**.
+
+- **Tracker tags** (first section) — location-tracker tags (AirTag, SmartTag, Tile, …) seen in at
+  least `matchThreshold` snapshots. `[separated]` means the tag reports it is away from its owner; a
+  separated tag that recurs across snapshots taken at different places is what tracker-detection apps
+  such as AirGuard alert on. Open its device detail to watch its live signal and locate it. Tags near
+  their owner (for example, other people's keys nearby) are normal.
 - **Recurring identities** — the main result. Each line is a device that appeared in at least
   `matchThreshold` of your snapshots, with its best identity label (hostname, BLE name, device type,
   vendor, or a probed-SSID), its OS family, radio, and a representative MAC. A device that recurs

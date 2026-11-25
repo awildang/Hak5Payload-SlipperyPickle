@@ -36,6 +36,8 @@ goal — they have to survive on constrained ESP32 firmware, not just on the WiF
 | `blue5.db` → `bt_device` | the Bluetooth recon daemon | MAC, RSSI, company ID, name, `le_random` flag, manufacturer data, service data |
 | Live monitor interface | `tcpdump` (Stage 2) | raw probe-request frames → IE fingerprint + sequence number |
 | `dhcp.leases` | the Pineapple's DHCP server | hostnames of devices that joined *your* access point |
+| `known.txt` (loot) | **Learn known here** / you | identity tokens of your own/authorised devices, hidden from results |
+| `history.txt` (loot) | written each Compare | per-token first/last-seen + session count, for cross-session memory (auto-expired after `histDays`) |
 
 A single long-lived `awk` co-process loads the OUI vendor table into memory once and decodes both
 database feeds on every pass, so the hot path never re-greps a 40k-line file per device.
@@ -102,8 +104,8 @@ clustering pass. Two records are unioned when they share a **strong identity tok
 | Token | Source | Strength |
 |-------|--------|----------|
 | hostname | DHCP | strongest (only for devices on your AP) |
-| probed-SSID set | PNL rare-SSID union | strong, survives Wi-Fi MAC rotation |
-| IE fingerprint | Stage 2 | strong, survives Wi-Fi MAC rotation |
+| probed-SSID set | PNL rare-SSID union (probe requests only; AP beacons are excluded) | strong when rare, survives Wi-Fi MAC rotation |
+| IE fingerprint | Stage 2, rare-fingerprint union | links only when shared by 2..`fpCommon` identities; a fingerprint shared by more is a common phone model, not one device |
 | BLE company + advertised name | `blue5.db` | strong (requires a real name, not a generic model, to avoid merging distinct nameless devices) |
 | stable MAC | Wi-Fi global bit / BT `le_random=0` | medium |
 
@@ -112,6 +114,18 @@ as a match key, because an identifier shared by every device of a brand would me
 
 After clustering:
 
+- **Tracker tags** — clusters whose Bluetooth advert decodes as a location-tracker tag (AirTag, Find My
+  accessory, SmartTag, Tile, Chipolo, Pebblebee, Google Find My Device, DULT-standard tags; byte rules
+  from AirGuard) and that recur in at least `matchThreshold` snapshots get their own section, tags
+  reporting "separated from owner" first. Tags never enter cross-radio pairing (they have no Wi-Fi).
+  Separated tags keep their address for about a day, so they recur across a session; tags near their
+  owner rotate about every 15 minutes, so they mostly will not.
+- **Known devices** — clusters matching any token in `known.txt` are hidden from every section
+  (a count is shown). Tokens are the same per-device identifiers used for clustering, so a known
+  device stays hidden even after it rotates its MAC.
+- **Dwell & cross-session history** — each reported cluster carries its dwell (min first-seen to
+  max last-seen across its observations) and a session count looked up from `history.txt` by token.
+  After the report, the session's tokens are folded back into `history.txt` and old entries expired.
 - **Recurring identities** — clusters seen in at least `matchThreshold` snapshots are reported as the
   high-confidence result (the signature of a device that keeps reappearing along your route).
 - **Cross-radio candidates** — a separate, clearly-labelled low-confidence pass pairs a Wi-Fi cluster

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Title: SlipperyPickle
 # Author: SlipperyPickle contributors
-# Version: 20261122-rc1
+# Version: 20261124-rc1
 # Category: reconnaissance/fingerprinting
 # Platform: WiFi Pineapple
 #
@@ -28,7 +28,7 @@
 # IDENTITY SIGNALS used by "Compare snapshots" (strongest -> weakest, all passive):
 #   - Hostname (DHCP, only devices on OUR AP)            H: token
 #   - Probed-SSID list / PNL (recon.db ssid)            rare-SSID union  [Martin'17]
-#   - 802.11 IE fingerprint (Stage 2, live wlan0mon)    F: token         [Vanhoef'16/Martin'17]
+#   - 802.11 IE fingerprint (Stage 2, live wlan0mon)    rare-fp union    [Vanhoef'16/Martin'17]
 #   - 802.11 sequence number (Stage 2, detail view)     manual rotation  [Vanhoef'16]
 #   - BLE company+name / Continuity device-type         B: token         [Martin'19/Celosia'20]
 #   - Stable MAC (WiFi global bit; BT le_random=0)      M: token         [Becker'19]
@@ -53,9 +53,18 @@
 #   Cross-radio WiFi<->BT pairing  Longo 2018, passive co-presence (IEEE 8407082)
 #   Huawei / HarmonyOS vendor IDs  Huawei CloudCampus + HarmonyOS whitepaper
 #   Xiaomi / Mi (MIoT) vendor IDs  Bluetooth SIG company 0x038F + MIoT service UUID 0xFE95
+#   Tracker-tag detection ........ Heinrich 2022, "AirGuard" (arXiv 2202.11813) - AirTag/FindMy/SmartTag/Tile/
+#                                   Chipolo/Pebblebee/Google FMDN byte rules; Apple+Google IETF DULT
+#                                   draft (service data 0xFCB2); BLE-Doubt 2022 persistence idea
+#   IE fingerprint rarity rule ... Baccichet 2024 (arXiv 2412.10548/2408.01578) + StateFi 2025: same-
+#                                   model phones share IEs, so a fingerprint links only when rare
 #   NOT implemented (hardware limit, documented for completeness):
 #     - BLE PHY-layer RF fingerprint ... Givehchian 2022 (IEEE S&P) - needs an SDR, not commodity radios
 #     - AWDL / AirDrop identity leaks .. Stute 2019 (USENIX Sec) - needs an AWDL channel-hopping sniff
+#     - BLE allowlist side channel ..... Zhang & Lin 2022 (CCS) - active; needs to spoof our own
+#                                         BLE address, but LE Set Random Address is Command-Disallowed
+#                                         while blue5 owns the radio for recon. Would require seizing
+#                                         the controller from PineAP (kills the passive BT feed).
 #
 # THREE-STAGE IDENTITY ARCHITECTURE (strongest/safest first)
 #   Each stage adds identity signal while staying as passive as the hardware allows.
@@ -112,8 +121,8 @@
 #
 # CONTROLS (pop-up menu + live radar)
 #   Main Menu (one scrollable list - scroll down for items below the screen):
-#     Start scan | Take snapshot | Compare snapshots | Stop & exit |
-#     Active mode: OFF/ON (toggle) | Probe BT device (ACTIVE, only when active mode is on)
+#     Start scan | Take snapshot | Compare snapshots | Learn known here | Clear saved data |
+#     Stop & exit | Active mode: OFF/ON (toggle) | Probe BT device (ACTIVE, only when active mode is on)
 #   In the live radar:  RED = back to menu    GREEN = device identifiers for a picked MAC
 #
 # LED: Blue=idle  Amber=processing/compare  Green=ok/snapshot  Red=recurring-device hit/err
@@ -122,7 +131,7 @@
 # ============================================================
 # CONFIG
 # ============================================================
-version="20261122-rc1"               # shown on the radar's top line so you can see which build is live
+version="20261124-rc1"               # shown on the radar's top line so you can see which build is live
 baseDir="/root/loot/slipperypickle"
 # --- Live radar (read recon.db + blue5.db) ---
 liveWifi=true              # include WiFi devices from recon.db (needs PineAP Recon running)
@@ -139,7 +148,12 @@ matchThreshold=2           # flag identities seen in >= N snapshots
 rssiTol=10                 # dBm: max signal gap to call a WiFi & BT device "co-located"
 xcorrMin=2                 # min shared snapshots for a WiFi+BT pairing to be flagged
 pnlCommon=6                # PNL: an SSID probed by > this many identities is "public" (not an identity key)
+fpCommon=4                 # IE fingerprint: one shared by > this many identities is a common phone
+                           #   model/OS build, not one device, so it does not merge them. Raise it
+                           #   to link heavy MAC-rotators more; lower it to avoid merging look-alikes.
 xcorrCap=8                 # max cross-radio candidate pairs reported (ranked tightest-RSSI first)
+histDays=14                # cross-session history: forget an identity not seen for this many days
+                           #   (auto-expiry keeps the store bounded + old bystander data from lingering)
 liveIe=true                # Stage 2: passive 802.11 IE fingerprint from the live monitor iface (anti-randomization)
 # --- MASTER passive/active switch ---------------------------------------------------
 # activeFp=false  => PASSIVE fingerprinting ONLY (default). We only READ PineAP's DBs +
@@ -163,11 +177,27 @@ ouiFile="/lib/hak5/oui.txt"; [ -f "$ouiFile" ] || ouiFile="/rom/lib/hak5/oui.txt
 
 isRandomMac() { printf '%s' "$1" | grep -qiE '^[0-9A-F][2367ABEF]:'; }
 
+# Read-only sqlite query: dbQuery <db> <sql>. The recon daemons write their DBs live, so a
+# read can hit "database is locked" - wait up to 3 s for the lock. Returns non-zero on any
+# failure (locked, damaged, timeout) so callers can WARN instead of silently using no data.
+dbQuery() { timeout 10 sqlite3 -cmd ".timeout 3000" -separator '|' "$1" "$2" 2>/dev/null; }
+
+# recon.db query with one retry. Output is buffered, so a failed attempt never leaks partial rows.
+reconQuery() {
+    local out
+    out=$(dbQuery "$reconDb" "$1") || { sleep 1; out=$(dbQuery "$reconDb" "$1") || return 1; }
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+}
+
 vibrate() { local n="${1:-1}" i=0; while [ "$i" -lt "$n" ]; do
     echo 1 >/sys/class/gpio/vibrator/value 2>/dev/null; sleep 0.15
     echo 0 >/sys/class/gpio/vibrator/value 2>/dev/null; sleep 0.1; i=$((i+1)); done; }
 
 cleanup() {
+    # Only tear down if WE own the lock. A second copy that refused to start must not kill the
+    # running instance's tcpdump/etc or clear its state when its own EXIT trap fires.
+    [ "$weOwnLock" = 1 ] || return 0
     killall tcpdump 2>/dev/null
     killall btmgmt 2>/dev/null
     killall hcitool 2>/dev/null
@@ -205,26 +235,38 @@ cmpAwk="/tmp/slipperypickle_cmp.awk"               # identity correlation (union
 iefp="/tmp/slipperypickle_iefp"                     # MAC|FP accumulated from the live monitor iface
 seqf="/tmp/slipperypickle_seq"                      # MAC|seqno (802.11 sequence number, Stage 2 / Vanhoef'16)
 leases="/tmp/dhcp.leases"                           # DHCP hostnames (devices on OUR AP only)
+knownFile="$baseDir/known.txt"                      # identity tokens of YOUR own/authorized devices (persist)
+histFile="$baseDir/history.txt"                     # token<TAB>firstSeen<TAB>lastSeen<TAB>sessions (persist)
+lockFile="/tmp/slipperypickle.lock"                 # single-instance guard (holds our PID)
+weOwnLock=""                                        # set to 1 once we acquire the lock; gates cleanup
 ieIface=""                                         # chosen at startup: the monitor iface that is UP
 colPid=""; renPid=""; scanloopPid=""; fpcapPid=""
 
 # Background: feed WiFi (recon.db) + BT (blue5.db) observations into $obs.
-# Both radios are read from the two recon daemons' own sqlite DBs - we never scan. The heavy
+# Both radios are read from the two recon daemons' own sqlite DBs - we never scan.
 # A naive shell OUI lookup (grep a 40k-line file per device, every pass) was far too slow on
 # the WiFi Pineapple CPU. Instead a single PERSISTENT awk coprocess loads the OUI table into
 # memory ONCE, then transforms each pass's sqlite rows from its stdin in-memory (no per-device
 # forks). We just pipe "W|time|mac|signal|freq" and "B|last_seen|mac|rssi|company|name" lines
 # to it and it appends decoded rows to $obs. See $collectorAwk (written at startup).
 bgCollector() {
-    local now cut
+    local now cut w b wfail=0 bfail=0
     coproc awkCo { awk -v OUIFILE="$ouiFile" -v OBS="$obs" -f "$collectorAwk"; }
     while :; do
-        now=$(date +%s); cut=$((now - stale))
+        now=$(date +%s); cut=$((now - stale)); w=""; b=""
+        # A failed read (DB locked / damaged) must not pass silently: after 5 failed passes in
+        # a row, say so once on the radar. The counter resets on the next good read.
+        if [ "$liveWifi" = true ]; then
+            if w=$(dbQuery "$reconDb" "SELECT 'W', max(time), mac, signal, freq FROM wifi_device WHERE time>=$cut GROUP BY mac;"); then wfail=0
+            else wfail=$((wfail+1)); [ "$wfail" -eq 5 ] && LOG yellow "WARNING: recon.db unreadable (locked or damaged) - WiFi list is stale."; fi
+        fi
+        if [ "$liveBle" = true ] && [ -f "$blue5Db" ]; then
+            if b=$(dbQuery "$blue5Db" "SELECT 'B', max(last_seen), mac, rssi, company, replace(replace(replace(CAST(name AS TEXT),char(10),' '),char(13),' '),'|','/') FROM bt_device WHERE last_seen>=$cut GROUP BY mac;"); then bfail=0
+            else bfail=$((bfail+1)); [ "$bfail" -eq 5 ] && LOG yellow "WARNING: blue5.db unreadable (locked or damaged) - Bluetooth list is stale."; fi
+        fi
         {
-          [ "$liveWifi" = true ] && timeout 5 sqlite3 -separator '|' "$reconDb" \
-            "SELECT 'W', max(time), mac, signal, freq FROM wifi_device WHERE time>=$cut GROUP BY mac;" 2>/dev/null
-          [ "$liveBle" = true ] && [ -f "$blue5Db" ] && timeout 5 sqlite3 -separator '|' "$blue5Db" \
-            "SELECT 'B', max(last_seen), mac, rssi, company, replace(replace(replace(CAST(name AS TEXT),char(10),' '),char(13),' '),'|','/') FROM bt_device WHERE last_seen>=$cut GROUP BY mac;" 2>/dev/null
+          [ -n "$w" ] && printf '%s\n' "$w"
+          [ -n "$b" ] && printf '%s\n' "$b"
           echo "FLUSH|$now"
         } >&"${awkCo[1]}"
         sleep "$scanEvery"
@@ -313,43 +355,106 @@ RENDEREOF2
 }
 
 # GREEN: save current live set as an ENRICHED snapshot, then wipe the list.
-# Record = SRC|MAC|RND|VENDOR|FP|PROBES|BLECO|BLENAME|MODEL|HOST|OS|RSSI
+# Record = SRC|MAC|RND|VENDOR|FP|PROBES|BLECO|BLENAME|MODEL|HOST|OS|RSSI|AP|FIRSTSEEN|LASTSEEN
 # Enrichment (all best-effort, snapshot-time only - never in the hot radar loop):
 #   PROBES = probed-SSID set (PNL) joined from recon.db  -> survives WiFi MAC rotation
 #   RND    = randomized? (WiFi: locally-administered bit; BT: blue5 le_random flag)
 #   MODEL  = device type decoded from blue5 mfr/svcd (Apple Continuity type, FastPair, ...)
 #   HOST   = DHCP hostname (only devices on OUR AP)
 #   FP     = 802.11 IE fingerprint from $iefp (WiFi, Stage 2)
-snapshotAndClear() {
-    snapCount=$((snapCount+1))
-    out=$(printf '%s/snap_%02d.raw' "$sessionDir" "$snapCount")
-    local now cutoff base pnl bt lease ie
-    now=$(date +%s); cutoff=$((now - stale))
+# Build enriched records for the current live set into $1. Sets GLOBAL `warn` to any enrichment
+# reads that failed. Shared by snapshotAndClear and learnKnown (does not clear obs or snapCount).
+buildRecords() {
+    local out="$1" now cutoff base pnl bt lease ie
+    now=$(date +%s); cutoff=$((now - stale)); warn=""
     base="/tmp/sp_b.$$"; pnl="/tmp/sp_p.$$"; bt="/tmp/sp_t.$$"; lease="/tmp/sp_l.$$"; ie="/tmp/sp_i.$$"
     : > "$pnl"; : > "$bt"; : > "$lease"; : > "$ie"
-    # base: live set deduped (latest per mac) -> tagged "D"
-    awk -F'|' -v cut="$cutoff" '$1+0>=cut && $2!="" {print}' "$obs" \
-      | sort -t'|' -k2,2 -k1,1nr \
-      | awk -F'|' '!seen[$2]++ { k=toupper($2); gsub(/:/,"",k); print "D\t" k "\t" $4 "\t" $2 "\t" $3 "\t" $5 "\t" $6 "\t" $7 }' > "$base"
-    # PNL (probed-SSID set per client MAC) from recon.db
-    [ "$liveWifi" = true ] && timeout 8 sqlite3 -separator '|' "$reconDb" \
-      "SELECT upper(w.mac), replace(group_concat(DISTINCT CAST(s.ssid AS TEXT)),'|','/') FROM ssid s JOIN wifi_device w ON s.wifi_device=w.hash WHERE CAST(s.ssid AS TEXT)<>'' GROUP BY w.mac;" 2>/dev/null \
-      | awk -F'|' '{k=$1; gsub(/:/,"",k); g=$2; gsub(/,/,";",g); print "P\t" toupper(k) "\t" g}' > "$pnl"
+    # base: live set per mac -> tagged "D". Keeps the strongest-RSSI row's fields, and also the
+    # first/last observation epoch per mac (obs field 1) so Compare can compute dwell time.
+    awk -F'|' -v cut="$cutoff" '$1+0>=cut && $2!="" {
+        e=$1+0; m=$2; r=$3+0
+        if(!(m in f) || e<f[m]) f[m]=e
+        if(!(m in l) || e>l[m]) l[m]=e
+        if(!(m in rs) || r>rs[m]){ rs[m]=r; src[m]=$4; ven[m]=$5; co[m]=$6; nm[m]=$7 }
+      } END{ for(m in rs){ k=toupper(m); gsub(/:/,"",k)
+        print "D\t" k "\t" src[m] "\t" m "\t" rs[m] "\t" ven[m] "\t" co[m] "\t" nm[m] "\t" f[m] "\t" l[m] } }' "$obs" > "$base"
+    # PNL (probed-SSID set per client MAC) and the AP list, from recon.db.
+    # ssid.type: 4/5 = probe request (a client asking for a network), 8 = beacon (an AP
+    # announcing its own). Only PROBES are a PNL - counting beacons made every AP look like a
+    # client "probing" its own SSID and merged same-SSID APs (mesh / guest nets) into one device.
+    # A MAC that beacons is emitted as "A" (access point) so Compare can label it and keep it
+    # out of the WiFi<->BT pairing. The AP list reads ssid.bssid directly (no join).
+    # Each enrichment read can fail (DB locked / damaged). A failure is recorded in $warn, shown
+    # on screen and written to warnings.txt so the Compare report can say what was missing.
+    local q
+    if [ "$liveWifi" = true ]; then
+        if q=$(reconQuery "SELECT upper(w.mac), replace(group_concat(DISTINCT CAST(s.ssid AS TEXT)),'|','/') FROM ssid s CROSS JOIN wifi_device w ON s.wifi_device=w.hash WHERE s.type IN (4,5) AND CAST(s.ssid AS TEXT)<>'' GROUP BY w.mac;"); then
+            printf '%s\n' "$q" | awk -F'|' '{k=toupper($1); gsub(/:/,"",k); g=$2; gsub(/,/,";",g); if(g!="") print "P\t" k "\t" g}' > "$pnl"
+        else warn="$warn probed-SSID lists;"; fi
+        if q=$(reconQuery "SELECT DISTINCT upper(replace(bssid,':','')) FROM ssid WHERE type=8 AND bssid IS NOT NULL AND bssid<>'';"); then
+            printf '%s\n' "$q" | awk '$1!=""{print "A\t" $1}' >> "$pnl"
+        else warn="$warn access-point flags;"; fi
+    fi
     # BT enrich (le_random + raw mfr/svcd) from blue5.db
-    [ "$liveBle" = true ] && [ -f "$blue5Db" ] && timeout 8 sqlite3 -separator '|' "$blue5Db" \
-      "SELECT upper(mac), max(le_random), hex(mfr), hex(svcd) FROM bt_device WHERE last_seen>=$cutoff GROUP BY mac;" 2>/dev/null \
-      | awk -F'|' '{k=$1; gsub(/:/,"",k); print "B\t" toupper(k) "\t" $2 "\t" $3 "\t" $4}' > "$bt"
+    if [ "$liveBle" = true ] && [ -f "$blue5Db" ]; then
+        if q=$(dbQuery "$blue5Db" "SELECT upper(mac), max(le_random), hex(mfr), hex(svcd), ifnull(svc16,'') FROM bt_device WHERE last_seen>=$cutoff GROUP BY mac;"); then
+            printf '%s\n' "$q" | awk -F'|' '{k=$1; gsub(/:/,"",k); if(k!="") print "B\t" toupper(k) "\t" $2 "\t" $3 "\t" $4 "\t" $5}' > "$bt"
+        else warn="$warn Bluetooth device types;"; fi
+    fi
     # DHCP hostnames (devices that joined our AP)
     [ -f "$leases" ] && awk '{m=$2; gsub(/:/,"",m); h=$4; if(h=="*")h=""; if(m!="")print "H\t" toupper(m) "\t" h}' "$leases" > "$lease"
     # IE fingerprints (dedup latest per mac)
     [ -f "$iefp" ] && awk -F'|' '{fp[$1]=$2} END{for(m in fp) print "F\t" m "\t" fp[m]}' "$iefp" > "$ie"
-    # merge: maps first (fill arrays), then "D" rows emit the 12-field record
+    # merge: maps first (fill arrays), then "D" rows emit the full record
     cat "$pnl" "$bt" "$lease" "$ie" "$base" | awk -f "$snapAwk" > "$out"
     rm -f "$base" "$pnl" "$bt" "$lease" "$ie"
+}
+
+snapshotAndClear() {
+    snapCount=$((snapCount+1))
+    out=$(printf '%s/snap_%02d.raw' "$sessionDir" "$snapCount")
+    buildRecords "$out"
     local c; c=$(wc -l < "$out")
     : > "$obs"
     LED GREEN; vibrate 1
     LOG green ">>> Snapshot #$snapCount saved ($c devices). List cleared."
+    if [ -n "$warn" ]; then
+        echo "Snapshot #$snapCount is missing:$warn (database locked or damaged at the time)" >> "$sessionDir/warnings.txt"
+        LOG yellow "WARNING: snapshot #$snapCount is missing:$warn"
+    fi
+}
+
+# Add every currently-present device's strong identity tokens (hostname / BLE name / stable MAC)
+# to the known-devices file so they are hidden from Compare. Pointer-driven - no MAC typing - and
+# does NOT take a snapshot or clear the live list. Token format matches the correlation engine.
+learnKnown() {
+    LED AMBER; LOG blue "Learning current devices as known/authorized..."
+    local tmp="/tmp/sp_learn.$$" before after
+    before=$([ -f "$knownFile" ] && wc -l < "$knownFile" || echo 0)
+    buildRecords "$tmp"
+    awk -F'|' '{ mac=$2; rnd=$3; bleco=$7; blen=$8; host=$10
+        if(host!="" && host!="*") print "H:" tolower(host)
+        if(bleco!="" && blen!="")  print "B:" bleco ":" tolower(blen)
+        if(mac!="" && rnd=="0")     print "M:" mac }' "$tmp" >> "$knownFile" 2>/dev/null
+    rm -f "$tmp"
+    [ -f "$knownFile" ] && sort -u "$knownFile" -o "$knownFile" 2>/dev/null
+    after=$(wc -l < "$knownFile" 2>/dev/null)
+    LED GREEN; vibrate 1
+    PROMPT "Known devices: ${before:-0} -> ${after:-0} identities.
+They are now hidden from Compare results.
+(Only devices with a stable identity - hostname, BLE name, or non-random MAC - can be learned.)"
+}
+
+# Clear persistent data (pointer-driven, with confirm). Covers both the cross-session history
+# and the known-devices list - this is how you reset the stored data without a keyboard.
+clearHistory() {
+    local c
+    c=$(LIST_PICKER "Clear saved data?" "Cross-session history" "Known-devices list" "Cancel" "Cancel")
+    case "$c" in
+        "Cross-session history") rm -f "$histFile"; LOG green "Cross-session history cleared." ;;
+        "Known-devices list")    rm -f "$knownFile"; LOG green "Known-devices list cleared." ;;
+        *)                       LOG green "Nothing cleared." ;;
+    esac
 }
 
 doCompare() {
@@ -369,28 +474,56 @@ doCompare() {
     done
 
     # Correlation runs in $cmpAwk (written at startup). Union-find over STRONG identity
-    # tokens that survive MAC rotation: H:hostname  B:company:name  F:IE-fingerprint
-    # M:stable-MAC (WiFi global bit / BT le_random=0), plus PNL rare-SSID union (devices
-    # that probe the same uncommon SSID set are linked even across rotated MACs - Martin
-    # 2017) and a mutual-nearest-neighbour cross-radio pass (Longo 2018). See $cmpAwk.
+    # tokens that survive MAC rotation: H:hostname  B:company:name
+    # M:stable-MAC (WiFi global bit / BT le_random=0), plus two RARE-value unions: devices
+    # that probe the same uncommon SSID set (PNL, Martin 2017) or share an uncommon IE
+    # fingerprint are linked even across rotated MACs. Then a mutual-nearest-neighbour
+    # cross-radio pass (Longo 2018) that skips access points. See $cmpAwk.
     awk -F'|' -v TH="$matchThreshold" -v NS="$snapCount" -v TOL="$rssiTol" \
-        -v XMIN="$xcorrMin" -v CMN="$pnlCommon" -v XCAP="$xcorrCap" \
+        -v XMIN="$xcorrMin" -v CMN="$pnlCommon" -v FCM="$fpCommon" -v XCAP="$xcorrCap" \
+        -v KNOWN="$knownFile" -v HIST="$histFile" -v NOW="$(date +%s)" \
         -f "$cmpAwk" "$master" > "${master}.out"
 
-    local flagged xcount TAB; TAB=$(printf '\t')
+    local flagged xcount tcount tsep kcount TAB; TAB=$(printf '\t')
     flagged=$(grep -m1 '^FLAGGED' "${master}.out" | awk '{print $2}')
     xcount=$(grep -m1 '^CROSS' "${master}.out" | awk '{print $2}')
+    tcount=$(grep -m1 '^TRACKERS' "${master}.out" | awk '{print $2}')
+    tsep=$(grep -m1 '^TRACKERS' "${master}.out" | awk '{print $3}')
+    kcount=$(grep -m1 '^KNOWN' "${master}.out" | awk '{print $2}')
     {
         echo "=== SlipperyPickle identity correlation ==="
         echo "Session   : $sessionDir"
         echo "Date      : $(date)"
         echo "Snapshots : $snapCount   Thresh: $matchThreshold   RSSI tol: ${rssiTol}dBm"
+        if [ -s "$sessionDir/warnings.txt" ]; then
+            echo
+            echo "!! INCOMPLETE DATA - some links may be missing:"
+            sed 's/^/   /' "$sessionDir/warnings.txt"
+        fi
+        [ "${kcount:-0}" -gt 0 ] && echo "Known/authorized devices hidden: $kcount  (add: 'Learn known here'; reset: 'Clear saved data')"
+        echo
+        echo "-- Tracker tags seen in >= $matchThreshold snapshots (AirTag/SmartTag/Tile/...) --"
+        if [ "${tcount:-0}" -gt 0 ]; then
+            printf '%-7s %-28s %s\n' "SEEN" "TAG" "MAC"
+            echo "---------------------------------------------------------------------"
+            grep '^t' "${master}.out" | cut -f2- | while IFS="$TAB" read -r sn tg mc; do
+                printf '%-7s %-28s %s\n' "$sn" "$tg" "$mc"
+            done
+            echo "[separated] = the tag reports it is away from its owner. A separated tag that"
+            echo "recurs across snapshots taken at different places is what AirGuard flags as"
+            echo "an unwanted tracker. The device-detail view shows its live signal to locate it."
+        else
+            echo "(none)"
+        fi
         echo
         echo "-- Recurring identities (same radio, >= $matchThreshold snaps) --"
-        printf '%-7s %-24s %-7s %-5s %s\n' "SEEN" "IDENTITY" "OS" "RADIO" "MAC"
+        echo "   DWELL = time present this session; HIST = sessions seen (x2 = also a prior run)"
+        printf '%-6s %-20s %-6s %-4s %-6s %-4s %s\n' "SEEN" "IDENTITY" "OS" "RAD" "DWELL" "HIST" "MAC"
         echo "---------------------------------------------------------------------"
-        grep '^f' "${master}.out" | cut -f2- | while IFS="$TAB" read -r sn lbl os rd mc; do
-            printf '%-7s %-24s %-7s %-5s %s\n' "$sn" "${lbl:0:24}" "${os:0:7}" "$rd" "$mc"
+        grep '^f' "${master}.out" | cut -f2- | while IFS="$TAB" read -r sn lbl os rd mc dw ss; do
+            if [ "${dw:-0}" -lt 60 ] 2>/dev/null; then dwm="<1m"; else dwm="$(( dw / 60 ))m"; fi
+            if [ "${ss:-1}" -gt 1 ] 2>/dev/null; then hist="x$ss"; else hist="new"; fi
+            printf '%-6s %-20s %-6s %-4s %-6s %-4s %s\n' "$sn" "${lbl:0:20}" "${os:0:6}" "$rd" "$dwm" "$hist" "$mc"
         done
         echo
         echo "-- Cross-radio candidates (WiFi+BT co-present - LOW confidence) --"
@@ -413,9 +546,29 @@ doCompare() {
         echo "      earbuds / tracker / car. The recurring-identity list above (PNL / IE-FP /"
         echo "      stable MAC) is the high-confidence result."
     } > "$report"
-    rm -f "$master" "${master}.out"
 
-    if [ -n "$flagged" ] && [ "$flagged" -gt 0 ]; then
+    # Fold this session's identity tokens into the cross-session history store, then expire
+    # anything not seen in histDays. Store line = token<TAB>firstSeen<TAB>lastSeen<TAB>sessions.
+    awk -F'\t' '$1=="k"{print $2}' "${master}.out" | sort -u > "${master}.tok"
+    # Read the existing history in BEGIN (robust to an empty/missing file - the FNR==NR idiom
+    # breaks when the first file is empty), fold in this session's tokens, expire old entries.
+    awk -v NOW="$(date +%s)" -v DAYS="$histDays" -v HF="$histFile" '
+        BEGIN{ while((getline L < HF)>0){ n=split(L,A,"\t"); if(n>=4 && A[1]!=""){
+                 f[A[1]]=A[2]; l[A[1]]=A[3]; s[A[1]]=A[4] } } close(HF) }
+        { t=$0; if(t==""){next} if(t in f){ l[t]=NOW; s[t]=s[t]+1 }
+          else { f[t]=NOW; l[t]=NOW; s[t]=1 } }
+        END{ cut=NOW-DAYS*86400
+          for(t in f){ if(l[t]+0>=cut) printf "%s\t%s\t%s\t%s\n", t, f[t], l[t], s[t] } }
+    ' "${master}.tok" > "${histFile}.new" 2>/dev/null && mv "${histFile}.new" "$histFile"
+    rm -f "$master" "${master}.out" "${master}.tok"
+
+    if [ "${tsep:-0}" -gt 0 ]; then
+        LED RED; vibrate 3
+        ALERT "SlipperyPickle: $tsep tracker tag(s) away from owner, recurring" "$(head -n 30 "$report")"
+    elif [ "${tcount:-0}" -gt 0 ]; then
+        LED RED; vibrate 2
+        ALERT "SlipperyPickle: $tcount tracker tag(s) recurring" "$(head -n 30 "$report")"
+    elif [ -n "$flagged" ] && [ "$flagged" -gt 0 ]; then
         LED RED; vibrate 2
         ALERT "SlipperyPickle: $flagged recurring device(s)${xcount:+  (+$xcount x-radio cand.)}" "$(head -n 30 "$report")"
     elif [ "${xcount:-0}" -gt 0 ]; then
@@ -467,22 +620,16 @@ showDeviceDetailLive() {
         }' "$obs")
     # --- identity enrichment for this one MAC (best-effort, read-only) ---
     # Probed-SSID list (PNL) - the anti-randomization WiFi identity
-    pnl2=$(timeout 6 sqlite3 "$reconDb" "SELECT group_concat(DISTINCT CAST(s.ssid AS TEXT)) FROM ssid s JOIN wifi_device w ON s.wifi_device=w.hash WHERE upper(replace(w.mac,':',''))='$nkey' AND CAST(s.ssid AS TEXT)<>'';" 2>/dev/null)
+    pnl2=$(reconQuery "SELECT group_concat(DISTINCT CAST(ssid AS TEXT)) FROM ssid WHERE type IN (4,5) AND CAST(ssid AS TEXT)<>'' AND wifi_device IN (SELECT hash FROM wifi_device NOT INDEXED WHERE upper(replace(mac,':',''))='$nkey');")
     # BT: le_random (trackable?) + device type from Continuity/service data
-    btrow=$(timeout 6 sqlite3 -separator '|' "$blue5Db" "SELECT max(le_random), upper(hex(mfr)), upper(hex(svcd)) FROM bt_device WHERE upper(mac)='$nkey';" 2>/dev/null)
+    btrow=$(dbQuery "$blue5Db" "SELECT max(le_random), upper(hex(mfr)), upper(hex(svcd)), ifnull(svc16,'') FROM bt_device WHERE upper(replace(mac,':',''))='$nkey' ORDER BY last_seen DESC LIMIT 1;")
     if [ -n "$btrow" ]; then
         lerand2=$(printf '%s' "$btrow" | cut -d'|' -f1)
-        dtype2=$(printf '%s' "$btrow" | awk -F'|' '{m=$2;s=$3;
-            if(substr(m,1,4)=="4C00"){t=substr(m,5,2);
-              if(t=="07")print "AirPods/accessory"; else if(t=="10")print "iPhone/Nearby";
-              else if(t=="12")print "iDevice/FindMy"; else if(t=="0C")print "Handoff";
-              else if(t=="05")print "AirDrop"; else if(t=="02")print "iBeacon"; else print "Apple"}
-            else if(substr(m,1,4)=="7500")print "Samsung";
-            else if(substr(m,1,4)=="027D")print "Huawei";
-            else if(substr(m,1,4)=="8F03")print "Xiaomi";
-            else if(s ~ /FE95|95FE/)print "Xiaomi/Mi (MIoT)";
-            else if(s ~ /FE2C|2CFE/)print "Google FastPair";
-            else if(s ~ /FD5A|5AFD/)print "Samsung svc"; }')
+        # same decoder as the snapshot (incl. tracker tags): feed one B + one D row to $snapAwk
+        # and take the MODEL field (9) of the record it prints
+        dtype2=$(printf '%s' "$btrow" | awk -F'|' -v K="$nkey" '{print "B\t" K "\t" $1 "\t" $2 "\t" $3 "\t" $4; print "D\t" K "\tBLE\t" K "\t\t\t\t"}' \
+                 | awk -f "$snapAwk" | cut -d'|' -f9)
+        case "$dtype2" in *separated*) dtype2="$dtype2  << tracker tag, away from its owner";; esac
     fi
     # 802.11 IE fingerprint (stable across MAC rotation)
     [ -f "$iefp" ] && fp2=$(grep -i "^$nkey|" "$iefp" 2>/dev/null | tail -1 | cut -d'|' -f2)
@@ -651,15 +798,17 @@ menu() {
         fi
         # Flat, titled, SCROLLABLE list - scroll down to reach items below the screen.
         if [ -n "$extra" ]; then
-            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Stop & exit" "$modeItem" "$extra" "Start scan")
+            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "$extra" "Start scan")
         else
-            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Stop & exit" "$modeItem" "Start scan")
+            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "Start scan")
         fi
         [ $? -ne 0 ] && continue
         case "$choice" in
             "Start scan")                 radar ;;
             "Take snapshot")              snapshotAndClear ;;
             "Compare snapshots")          doCompare ;;
+            "Learn known here")           learnKnown ;;
+            "Clear saved data")           clearHistory ;;
             "Active mode: OFF (enable)")  enableActive ;;
             "Active mode: ON (disable)")  activeFp=false; LOG green "ACTIVE mode OFF - passive only (Stages 1-2)." ;;
             "Probe BT device (ACTIVE!)")  gattProbe ;;
@@ -677,9 +826,24 @@ menu() {
 if [ "$liveBle" = true ] && [ ! -f "$blue5Db" ]; then
     LOG yellow "Bluetooth needs PineAP Recon (blue5) running - blue5.db not found yet."
 fi
+# Single-instance guard: a second copy would collide with this one on the shared /tmp files
+# (collector/parser awks, $obs). Refuse to start if another live instance holds the lock; a
+# stale lock from a crashed run (its PID no longer alive) is taken over. Must run BEFORE we
+# touch any shared state, and cleanup() / cleanupLive() are gated on weOwnLock so this refusal
+# path never disturbs the instance that is actually running.
+if [ -f "$lockFile" ] && kill -0 "$(cat "$lockFile" 2>/dev/null)" 2>/dev/null; then
+    LOG red "Already running (pid $(cat "$lockFile" 2>/dev/null)) - not starting a second copy."
+    ERROR_DIALOG "SlipperyPickle is already running. Close the other copy first."
+    exit 1
+fi
+echo $$ > "$lockFile"; weOwnLock=1
+
 : > "$obs"; rm -f "$pause"
 
 cleanupLive() {
+    # Only our own instance may tear down the shared /tmp state (a refused second copy must not
+    # delete the running instance's collector/parser awk files - that was the two-copy foot-gun).
+    [ "$weOwnLock" = 1 ] || return 0
     kill "$colPid" "$renPid" "$scanloopPid" "$fpcapPid" 2>/dev/null
     # stop the resident collector + fp-parser awks (killing the parent closes their stdin so
     # they EOF, but match by name too so a stray never leaks an OUI/parser awk across relaunches).
@@ -688,7 +852,7 @@ cleanupLive() {
     done
     killall tcpdump 2>/dev/null           # the Stage-2 IE sniffer
     rm -f "$pause" "$obs" "$obs.t" "$collectorAwk" "$fpcapAwk" "$snapAwk" "$cmpAwk" "$iefp" "$seqf" \
-          /tmp/sp_b.* /tmp/sp_p.* /tmp/sp_t.* /tmp/sp_l.* /tmp/sp_i.* 2>/dev/null
+          "$lockFile" /tmp/sp_b.* /tmp/sp_p.* /tmp/sp_t.* /tmp/sp_l.* /tmp/sp_i.* 2>/dev/null
 }
 trap 'cleanupLive; cleanup' EXIT INT TERM
 
@@ -766,10 +930,44 @@ END{ finish() }
 FPEOF
 
 # Snapshot enrichment merge: maps (P=PNL, B=BT le_random/mfr/svcd, H=hostname, F=IE-fp) are
-# read first, then each live device row "D" emits the 12-field snapshot record.
+# read first, then each live device row "D" emits the 15-field snapshot record.
 cat > "$snapAwk" <<'SNEOF'
-function devtype(mfr,svcd,  t){
-  mfr=toupper(mfr); svcd=toupper(svcd)
+# one hex byte "A7" -> 167 (busybox awk has no strtonum); -1 if not hex
+function hb(s,  a,b){ a=index("0123456789ABCDEF",substr(s,1,1)); b=index("0123456789ABCDEF",substr(s,2,1))
+  if(a==0||b==0) return -1; return (a-1)*16+(b-1) }
+# blue5 stores svcd as raw advertising structures: <len><0x16><uuid LE><data>... Return the
+# data of the structure for 16-bit service UUID u (e.g. "FD5A"), or "NONE" if absent.
+function sdata(svcd,u,  p,n,len,uu){ p=1; n=length(svcd)
+  while(p+5<=n){ len=hb(substr(svcd,p,2)); if(len<1) break
+    if(substr(svcd,p+2,2)=="16" && len>=3){ uu=substr(svcd,p+6,2) substr(svcd,p+4,2)
+      if(uu==u) return substr(svcd,p+8,(len-3)*2) }
+    p=p+2+len*2 }
+  return "NONE" }
+# svc16 is a comma list of advertised 16-bit service UUIDs, e.g. "FEF3" or "1105,110A"
+function has16(svc16,u){ return index("," svc16 ",", "," u ",")>0 }
+# Location-tracker tags. Byte rules follow the AirGuard app (Heinrich et al., arXiv 2202.11813;
+# github.com/seemoo-lab/AirGuard) and the Apple/Google DULT draft (service data 0xFCB2).
+# "[separated]" = the tag reports it is away from its owner - the state a planted tag is in.
+function tracker(mfr,svcd,svc16,  ln,st,dt,sep,d,b0){
+  if(substr(mfr,1,6)=="4C0012" && length(mfr)>=10){        # Apple Find My (offline finding)
+    ln=substr(mfr,7,2); st=hb(substr(mfr,9,2)); if(st<0) return ""
+    dt=int(st/16)%4; sep=(ln=="19")                       # (status & 0x30)>>4; len 0x19 = separated
+    if(dt==1) return "AirTag" (sep?" [separated]":"")
+    if(dt==2) return "FindMy-tag" (sep?" [separated]":"") # third-party Find My accessory
+    return "" }                                           # 0 = iPhone/Mac, 3 = AirPods: not tags
+  d=sdata(svcd,"FD5A")                                    # Samsung SmartTag: data[0] & 0xF8 == 0x10
+  if(d!="NONE"){ b0=hb(substr(d,1,2)); if(b0>=0 && int(b0/8)==2) return "SmartTag" }
+  d=sdata(svcd,"FEED"); if(substr(d,1,4)=="0200") return "Tile"
+  if(has16(svc16,"FE33")) return "Chipolo"
+  if(has16(svc16,"FA25") || sdata(svcd,"FA25")!="NONE") return "Pebblebee"
+  d=sdata(svcd,"FEAA")                                    # Google Find My Device network frames
+  if(substr(d,1,2)=="40") return "Google-FMDN"
+  if(substr(d,1,2)=="41") return "Google-FMDN [separated]"
+  if(sdata(svcd,"FCB2")!="NONE") return "DULT-tag"
+  return "" }
+function devtype(mfr,svcd,svc16,  t){
+  mfr=toupper(mfr); svcd=toupper(svcd); svc16=toupper(svc16)
+  t=tracker(mfr,svcd,svc16); if(t!="") return t
   if(substr(mfr,1,4)=="4C00"){ t=substr(mfr,5,2)
     if(t=="02")return "AppleBeacon"; if(t=="05")return "AirDrop"; if(t=="07")return "AirPods"
     if(t=="09"||t=="0A")return "AirPlay"; if(t=="0C")return "Handoff"
@@ -779,14 +977,16 @@ function devtype(mfr,svcd,  t){
   if(substr(mfr,1,4)=="0600") return "Microsoft"
   if(substr(mfr,1,4)=="027D"||substr(mfr,1,4)=="7D02") return "Huawei"
   if(substr(mfr,1,4)=="8F03"||substr(mfr,1,4)=="038F") return "Xiaomi"
-  if(svcd ~ /FE95/ || svcd ~ /95FE/) return "Xiaomi/Mi"
-  if(svcd ~ /2CFE/ || svcd ~ /FE2C/) return "FastPair"
-  if(svcd ~ /6FFD/ || svcd ~ /FD6F/) return "ExposureNotif"
-  if(svcd ~ /AAFE/ || svcd ~ /FEAA/) return "Eddystone"
-  if(svcd ~ /5AFD/ || svcd ~ /FD5A/) return "Samsung"
+  if(sdata(svcd,"FE95")!="NONE" || has16(svc16,"FE95")) return "Xiaomi/Mi"
+  if(sdata(svcd,"FE2C")!="NONE" || has16(svc16,"FE2C")) return "FastPair"
+  if(sdata(svcd,"FD6F")!="NONE" || has16(svc16,"FD6F")) return "ExposureNotif"
+  if(sdata(svcd,"FEAA")!="NONE") return "Eddystone"
+  if(sdata(svcd,"FD69")!="NONE" || has16(svc16,"FD69")) return "Samsung-OfflineFind"
+  if(sdata(svcd,"FD5A")!="NONE" || has16(svc16,"FD5A")) return "Samsung"
   return ""
 }
 function osfam(ven,bleco,model){
+  if(model ~ /AirTag|FindMy-tag|SmartTag|Tile|Chipolo|Pebblebee|Google-FMDN|DULT-tag/) return "tag"
   if(bleco=="Apple"||ven~/Apple/||model~/Apple|AirP|iPhone|iDevice|Handoff|AirDrop|AirPlay|Nearby/) return "iOS/macOS"
   if(bleco=="Samsung"||ven~/Samsung/||model~/Samsung/) return "Android(Sam)"
   if(bleco=="Google"||ven~/Google/||model~/FastPair/) return "Android"
@@ -799,39 +999,64 @@ function osfam(ven,bleco,model){
 }
 BEGIN{FS="\t"}
 $1=="P"{ pnl[$2]=$3; next }
-$1=="B"{ ler[$2]=$3; mfrm[$2]=$4; svcm[$2]=$5; next }
+$1=="A"{ ap[$2]=1; next }
+$1=="B"{ ler[$2]=$3; mfrm[$2]=$4; svcm[$2]=$5; s16[$2]=$6; next }
 $1=="H"{ if($3!="") host[$2]=$3; next }
 $1=="F"{ fpm[$2]=$3; next }
 $1=="D"{
-  key=$2; src=$3; mac=$4; rssi=$5; ven=$6; bleco=$7; blen=$8
+  key=$2; src=$3; mac=$4; rssi=$5; ven=$6; bleco=$7; blen=$8; first=$9; last=$10
   isble=(src ~ /BLE|BTC/)
   if(isble){ rnd=(ler[key]==""?0:(ler[key]+0)) } else { rnd=(substr(toupper(mac),2,1) ~ /[2367ABEF]/)?1:0 }
-  model=devtype(mfrm[key],svcm[key]); os=osfam(ven,bleco,model)
+  model=devtype(mfrm[key],svcm[key],s16[key]); os=osfam(ven,bleco,model)
   fp=(isble?"":fpm[key])
-  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", src, mac, rnd, ven, fp, pnl[key], bleco, blen, model, host[key], os, rssi
+  isap=((!isble && (key in ap))?1:0)
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", src, mac, rnd, ven, fp, pnl[key], bleco, blen, model, host[key], os, rssi, isap, first, last
 }
 SNEOF
 
 # Identity correlation (union-find + PNL rare-SSID union + mutual-NN cross-radio).
 cat > "$cmpAwk" <<'CMEOF'
-BEGIN{FS="|"}
+BEGIN{ FS="|"
+  # KNOWN: one identity token per line = your own/authorized devices (see $knownFile).
+  if(KNOWN!=""){ while((getline L < KNOWN)>0){ if(L!="") kn[L]=1 } close(KNOWN) }
+  # HIST: token<TAB>firstSeen<TAB>lastSeen<TAB>sessions, from prior runs (see $histFile).
+  if(HIST!=""){ while((getline L < HIST)>0){ nf=split(L,HH,"\t"); if(nf>=4 && HH[1]!=""){
+       h_first[HH[1]]=HH[2]+0; h_sess[HH[1]]=HH[4]+0 } } close(HIST) }
+}
 function find(x,  r){ r=x; while(par[r]!=r && par[r]!="") r=par[r];
                       while(par[x]!=r && par[x]!=""){ n=par[x]; par[x]=r; x=n } return r }
 function uni(a,b,  ra,rb){ if(a==""||b=="")return; if(!(a in par))par[a]=a;
                       if(!(b in par))par[b]=b; ra=find(a); rb=find(b); if(ra!=rb)par[rb]=ra }
 function tok(x){ if(x==""||x=="?")return ""; if(!(x in par))par[x]=x; return x }
+# Past-session history for a cluster = the best (max sessions / earliest first-seen) over its
+# strong identity tokens. Tokens are per-device (hostname / BLE name / stable MAC), so they
+# persist across MAC rotation and across sessions.
+function rhist(r,  i,TT,nn){ Rsess[r]=0; Rfseen[r]=0
+  nn=split(Rtoks[r],TT,SUBSEP)
+  for(i=1;i<=nn;i++){ if(TT[i]=="")continue
+    if((TT[i] in h_sess) && h_sess[TT[i]]>Rsess[r]) Rsess[r]=h_sess[TT[i]]
+    if((TT[i] in h_first) && (Rfseen[r]==0 || h_first[TT[i]]<Rfseen[r])) Rfseen[r]=h_first[TT[i]] } }
 {
   snap=$1+0; src=$2; mac=$3; rnd=$4; ven=$5; fp=$6; probes=$7;
-  bleco=$8; blen=$9; model=$10; host=$11; os=$12; rssi=$13;
+  bleco=$8; blen=$9; model=$10; host=$11; os=$12; rssi=$13; isap=$14; first=$15; last=$16;
   radio="WIFI"; if(src ~ /BLE|BTC/) radio="BLE";
   delete T; nt=0;
   if(host!=""  && host!="*")                 T[++nt]="H:" tolower(host);
   if(bleco!="" && blen!="")                   T[++nt]="B:" bleco ":" tolower(blen);
-  if(fp!="")                                  T[++nt]="F:" fp;
   if(mac!="" && rnd=="0")                      T[++nt]="M:" mac;
   for(i=1;i<=nt;i++){ tok(T[i]); if(i>1) uni(T[1],T[i]) }
   if(nt>0) anchor=T[1];
   else { anchor="W:" src ":" mac; tok(anchor) }
+  # Per-key: strong identity tokens (for known-list + history), known flag, and dwell epochs.
+  for(i=1;i<=nt;i++){ if(!((anchor SUBSEP T[i]) in ktseen)){ ktseen[anchor SUBSEP T[i]]=1;
+        keytoks[anchor]=keytoks[anchor] SUBSEP T[i] } if(T[i] in kn) key_known[anchor]=1 }
+  if(first ~ /^[0-9]+$/){ fv=first+0; if(fv>0 && (!(anchor in kfirst)||fv<kfirst[anchor])) kfirst[anchor]=fv }
+  if(last  ~ /^[0-9]+$/){ lv=last+0;  if(lv>0 && (!(anchor in klast)||lv>klast[anchor]))  klast[anchor]=lv }
+  # The IE fingerprint is NOT unique: every phone of the same model + OS build sends the same
+  # IEs. So it is not a strong token; like the PNL it only links identities when it is RARE
+  # (shared by 2..FCM identities) - decided in END once all snapshots are read.
+  if(fp!="" && !((fp SUBSEP anchor) in faseen)){ faseen[fp SUBSEP anchor]=1;
+     fanch[fp]=fanch[fp] SUBSEP anchor; fcount[fp]++ }
   if(probes!=""){ np=split(probes, PP, ";");
      for(i=1;i<=np;i++){ s=PP[i]; if(s=="")continue; sl=tolower(s);
         if(!((sl SUBSEP anchor) in saseen)){ saseen[sl SUBSEP anchor]=1;
@@ -848,6 +1073,9 @@ function tok(x){ if(x==""||x=="?")return ""; if(!(x in par))par[x]=x; return x }
   if(blen!="")  ev_blen[key]=blen;
   if(ven!="" && ven!="?") ev_ven[key]=ven;
   if(fp!="")   ev_fp[key]=fp;
+  if(isap=="1") ev_ap[key]=1;
+  if(model ~ /AirTag|FindMy-tag|SmartTag|Tile|Chipolo|Pebblebee|Google-FMDN|DULT-tag/){
+     if(!(key in ev_trk) || model ~ /separated/) ev_trk[key]=model }
   if(probes!="" && !(key in ev_pnl)) ev_pnl[key]=probes;
   if(mac!="")  ev_macs[key]=ev_macs[key] (index(" " ev_macs[key] " ", " " mac " ")?"":(ev_macs[key]==""?"":" ") mac);
   allkeys[key]=1;
@@ -855,6 +1083,9 @@ function tok(x){ if(x==""||x=="?")return ""; if(!(x in par))par[x]=x; return x }
 END{
   for(s in scount){ if(scount[s]>=2 && scount[s]<=CMN){
      n=split(sanch[s], AA, SUBSEP); base="";
+     for(i=1;i<=n;i++){ if(AA[i]=="")continue; if(base=="")base=AA[i]; else uni(base,AA[i]) } } }
+  for(f in fcount){ if(fcount[f]>=2 && fcount[f]<=FCM){
+     n=split(fanch[f], AA, SUBSEP); base="";
      for(i=1;i<=n;i++){ if(AA[i]=="")continue; if(base=="")base=AA[i]; else uni(base,AA[i]) } } }
   for(k in allkeys){ r=find(k); root[k]=r; roots[r]=1 }
   for(sk in seen){ split(sk,sa,SUBSEP); kk=sa[1]; sn=sa[2]; r=root[kk];
@@ -871,8 +1102,15 @@ END{
     if(ev_blen[k]!="")  R_blen[r]=ev_blen[k];
     if(ev_ven[k]!="")   R_ven[r]=ev_ven[k];
     if(ev_fp[k]!="")    R_fp[r]=ev_fp[k];
+    if(k in ev_ap)      R_ap[r]=1;
+    if(k in ev_trk){ if(!(r in R_trk) || ev_trk[k] ~ /separated/) R_trk[r]=ev_trk[k] }
     if(ev_pnl[k]!="" && !(r in R_pnl)) R_pnl[r]=ev_pnl[k];
     if(ev_macs[k]!="")  R_macs[r]=R_macs[r] (R_macs[r]==""?"":" ") ev_macs[k];
+    if(k in key_known) R_known[r]=1;
+    if(k in kfirst){ if(!(r in Rfirst)||kfirst[k]<Rfirst[r]) Rfirst[r]=kfirst[k] }
+    if(k in klast){  if(!(r in Rlast) ||klast[k] >Rlast[r])  Rlast[r] =klast[k] }
+    nn=split(keytoks[k],TT,SUBSEP); for(ti=1;ti<=nn;ti++){ if(TT[ti]=="")continue
+       if(!((r SUBSEP TT[ti]) in rtseen)){ rtseen[r SUBSEP TT[ti]]=1; Rtoks[r]=Rtoks[r] SUBSEP TT[ti] } }
   }
   for(r in roots){
     lbl=R_host[r];
@@ -883,19 +1121,37 @@ END{
     if(lbl=="" && R_fp[r]!="") lbl="fp-dev";
     m=R_macs[r]; sub(/^ +/,"",m); split(m,mm," ");
     if(lbl=="") lbl=mm[1];
+    # Access points (anything that beacons) are infrastructure: say so in the label.
+    if(r in R_ap) lbl="AP " (R_ven[r]!=""? R_ven[r] : mm[1]);
+    # Tracker tags: the tag type says more than the vendor ("Apple") does.
+    if(r in R_trk) lbl="TAG " R_trk[r];
     R_lbl[r]=lbl; R_m1[r]=mm[1];
   }
-  n=0; for(r in roots){ if(cnt[r]>=TH) ord[++n]=r }
+  # Known/authorized devices (on the ignore-list) are hidden from every result section.
+  nk=0; for(r in roots){ if(r in R_known) nk++ }
+  n=0; for(r in roots){ if(cnt[r]>=TH && !(r in R_known)) ord[++n]=r }
   for(i=1;i<=n;i++)for(j=i+1;j<=n;j++) if(cnt[ord[j]]>cnt[ord[i]]){t=ord[i];ord[i]=ord[j];ord[j]=t}
+  # Tracker tags that recur across separated snapshots = the AirGuard / BLE-Doubt signal:
+  # the same tag keeps showing up wherever you are. Tags away from their owner rank first.
+  nt=0; for(r in roots){ if((r in R_trk) && cnt[r]>=TH && !(r in R_known)) tr[++nt]=r }
+  for(i=1;i<=nt;i++)for(j=i+1;j<=nt;j++){
+     si=(R_trk[tr[i]] ~ /separated/); sj=(R_trk[tr[j]] ~ /separated/)
+     if(sj>si || (sj==si && cnt[tr[j]]>cnt[tr[i]])){t=tr[i];tr[i]=tr[j];tr[j]=t} }
+  ns=0; for(i=1;i<=nt;i++) if(R_trk[tr[i]] ~ /separated/) ns++
+  printf("TRACKERS %d %d\n", nt, ns);
+  for(i=1;i<=nt;i++){ r=tr[i]; printf("t\t%d/%d\t%s\t%s\n", cnt[r], NS, R_trk[r], R_m1[r]) }
+  printf("KNOWN %d\n", nk);
   printf("FLAGGED %d\n", n);
-  for(i=1;i<=n;i++){ r=ord[i];
-    printf("f\t%d/%d\t%s\t%s\t%s\t%s\n", cnt[r], NS, R_lbl[r],
-           (R_os[r]!=""?R_os[r]:"-"), (Rrad[r]!=""?Rrad[r]:"-"), R_m1[r]);
+  for(i=1;i<=n;i++){ r=ord[i]; rhist(r)
+    dw=((r in Rlast)&&(r in Rfirst))?(Rlast[r]-Rfirst[r]):0; if(dw<0)dw=0
+    printf("f\t%d/%d\t%s\t%s\t%s\t%s\t%d\t%d\n", cnt[r], NS, R_lbl[r],
+           (R_os[r]!=""?R_os[r]:"-"), (Rrad[r]!=""?Rrad[r]:"-"), R_m1[r], dw, Rsess[r]+1);
   }
   nw=0; nb=0;
-  for(r in roots){ if(cnt[r]<XMIN) continue;
-     if(Rrad[r]=="WIFI") warr[++nw]=r;
-     else if(Rrad[r]=="BLE") barr[++nb]=r }
+  for(r in roots){ if(cnt[r]<XMIN || (r in R_known)) continue;
+     # an AP cannot be the WiFi radio of a phone/wearable, so APs never enter the pairing
+     if(Rrad[r]=="WIFI"){ if(!(r in R_ap)) warr[++nw]=r }
+     else if(Rrad[r]=="BLE"){ if(!(r in R_trk)) barr[++nb]=r } }   # a tag has no WiFi radio
   for(iw=1;iw<=nw;iw++){ a=warr[iw]; bestsc[a]=9999; bestb[a]="" }
   for(ib=1;ib<=nb;ib++){ b=barr[ib]; bbestsc[b]=9999; bbesta[b]="" }
   for(iw=1;iw<=nw;iw++){ a=warr[iw];
@@ -923,6 +1179,10 @@ END{
   for(i=1;i<=nx;i++){ a=XA[i]; b=XB[i];
       wl=R_lbl[a]; if(wl=="")wl=R_m1[a]; bl=R_lbl[b]; if(bl=="")bl=R_m1[b];
       printf("x\t%d/%d\t%d\t%s\t%s\t%s\t%s\n", XH[i], NS, XD[i], wl, bl, R_m1[a], R_m1[b]) }
+  # Emit this session's identity tokens (non-known) so the shell can fold them into the
+  # cross-session history store. One "k<TAB>token" line per distinct strong token seen.
+  for(r in roots){ if(r in R_known) continue
+     nn=split(Rtoks[r],TT,SUBSEP); for(i=1;i<=nn;i++){ if(TT[i]!="") print "k\t" TT[i] } }
 }
 CMEOF
 
@@ -937,6 +1197,13 @@ LED BLUE
 LOG green "=== SlipperyPickle v$version ready ==="
 LOG "RED=menu   GREEN=device info"
 [ "$liveWifi" = true ] && LOG yellow "WiFi+BT need PineAP Recon running."
+# One-time recon.db health check. Its index has been seen corrupt ("database disk image is
+# malformed"), which makes WiFi reads fail. Warn once (non-fatal, time-bounded); the per-read
+# guards still catch failures later.
+if [ "$liveWifi" = true ] && [ -f "$reconDb" ]; then
+    rchk=$(timeout 10 sqlite3 "$reconDb" "PRAGMA quick_check;" 2>&1 | head -1)
+    [ "$rchk" = "ok" ] || LOG red "WARNING: recon.db failed its integrity check ($rchk) - WiFi results may be incomplete. Reset recon data in the Pineapple UI."
+fi
 [ "$liveIe" = true ] && [ -n "$ieIface" ] && LOG "IE fingerprint: $ieIface"
 if [ "$activeFp" = true ]; then LOG red "MODE: ACTIVE fingerprinting ON (will connect to nearby devices)"; else LOG green "MODE: passive only (activeFp=false)"; fi
 
