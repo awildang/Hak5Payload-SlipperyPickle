@@ -1,7 +1,7 @@
 #!/bin/bash
 # Title: SlipperyPickle
 # Author: SlipperyPickle contributors
-# Version: 20261124-rc1
+# Version: 20261126-rc2
 # Category: reconnaissance/fingerprinting
 # Platform: WiFi Pineapple
 #
@@ -131,7 +131,7 @@
 # ============================================================
 # CONFIG
 # ============================================================
-version="20261124-rc1"               # shown on the radar's top line so you can see which build is live
+version="20261126-rc2"               # shown on the radar's top line so you can see which build is live
 baseDir="/root/loot/slipperypickle"
 # --- Live radar (read recon.db + blue5.db) ---
 liveWifi=true              # include WiFi devices from recon.db (needs PineAP Recon running)
@@ -261,7 +261,7 @@ bgCollector() {
             else wfail=$((wfail+1)); [ "$wfail" -eq 5 ] && LOG yellow "WARNING: recon.db unreadable (locked or damaged) - WiFi list is stale."; fi
         fi
         if [ "$liveBle" = true ] && [ -f "$blue5Db" ]; then
-            if b=$(dbQuery "$blue5Db" "SELECT 'B', max(last_seen), mac, rssi, company, replace(replace(replace(CAST(name AS TEXT),char(10),' '),char(13),' '),'|','/') FROM bt_device WHERE last_seen>=$cut GROUP BY mac;"); then bfail=0
+            if b=$(dbQuery "$blue5Db" "SELECT 'B', max(last_seen), mac, rssi, company, replace(replace(replace(CAST(name AS TEXT),char(10),' '),char(13),' '),'|','/'), hex(mfr), hex(svcd), ifnull(svc16,'') FROM bt_device WHERE last_seen>=$cut GROUP BY mac;"); then bfail=0
             else bfail=$((bfail+1)); [ "$bfail" -eq 5 ] && LOG yellow "WARNING: blue5.db unreadable (locked or damaged) - Bluetooth list is stale."; fi
         fi
         {
@@ -309,7 +309,8 @@ liveSnapshotRows() {
             r=$3; if(r !~ /^-[0-9]+$/) r=-120;
             k=200+r; if(k<0)k=0; if(k>200)k=200;
             lbl=$5; if($6!="")lbl=$6; if($7!="")lbl=$7; if(lbl==""||lbl=="?")lbl="Unknown";
-            printf "%03d|%s|%s|%s|%s\n", k, r, $2, $4, lbl }' \
+            src=$4; if($9!=""){ src="TAG"; lbl=$9 }   # tracker tag (obs field 9) -> src TAG, label = tag type
+            printf "%03d|%s|%s|%s|%s\n", k, r, $2, src, lbl }' \
       | sort -r \
       | awk -F'|' '{ print $2"|"$3"|"$4"|"$5 }'
 }
@@ -329,7 +330,7 @@ bgRenderer() {
         while IFS='|' read -r sig mac src lbl; do
             [ -z "$mac" ] && continue
             if [ "$sig" -gt -200 ] 2>/dev/null; then rb=$(( sig / 10 )); else rb="x"; fi
-            case "$src" in WIFI*|PINEAP*) tag=W;; BLE*|BTC*) tag=B;; *) tag="?";; esac
+            case "$src" in WIFI*|PINEAP*) tag=W;; TAG*) tag=T;; BLE*|BTC*) tag=B;; *) tag="?";; esac
             sigkey="$sigkey$rb$tag${mac: -8}${lbl:0:10};"
         done <<RENDEREOF
 $rows
@@ -345,7 +346,7 @@ RENDEREOF
         while IFS='|' read -r sig mac src lbl; do
             [ -z "$mac" ] && continue
             if [ "$sig" -gt -200 ] 2>/dev/null; then bar=$(makeBar "$sig"); disp="$sig"; else bar="----------"; disp="--"; fi
-            case "$src" in WIFI*|PINEAP*) tag=W;; BLE*|BTC*) tag=B;; *) tag="?";; esac
+            case "$src" in WIFI*|PINEAP*) tag=W;; TAG*) tag=T;; BLE*|BTC*) tag=B;; *) tag="?";; esac
             LOG "$(printf '%4s %s %s %s %s' "$disp" "$bar" "$tag" "${mac: -8}" "${lbl:0:10}")"
         done <<RENDEREOF2
 $rows
@@ -682,7 +683,7 @@ deviceBrowser() {
     while IFS='|' read -r sig mac src lbl; do
         [ -z "$mac" ] && continue
         [ "$sig" -gt -200 ] 2>/dev/null || sig="--"
-        case "$src" in WIFI*|PINEAP*) tag=W;; BLE*|BTC*) tag=B;; *) tag="?";; esac
+        case "$src" in WIFI*|PINEAP*) tag=W;; TAG*) tag=T;; BLE*|BTC*) tag=B;; *) tag="?";; esac
         macs+=("$mac")                          # keep full MAC for the detail lookup
         rows+=("$(printf '%4s %s %s %s' "$sig" "$tag" "${mac: -8}" "${lbl:0:12}")")
     done < <(liveSnapshotRows)
@@ -747,7 +748,7 @@ Set activeFp=true in config to enable.
     command -v gatttool >/dev/null 2>&1 || { PROMPT "gatttool not present."; return; }
     local rows=() macs=() sig mac src lbl pick i selMac name man mod fw svc
     while IFS='|' read -r sig mac src lbl; do
-        case "$src" in BLE*|BTC*) ;; *) continue;; esac
+        case "$src" in BLE*|BTC*|TAG*) ;; *) continue;; esac
         [ -z "$mac" ] && continue
         macs+=("$mac"); rows+=("$(printf '%4s B %s %s' "$sig" "${mac: -8}" "${lbl:0:12}")")
     done < <(liveSnapshotRows)
@@ -770,6 +771,235 @@ Services(GATT-fp): ${svc:-?}
 }
 
 # ============================================================
+# STAGE 3 (ACTIVE / INTRUSIVE, opt-in) - RING / PAGE a tracker tag
+# ============================================================
+# A location tag that is SEPARATED from its owner advertises connectable and exposes a
+# non-owner GATT "play sound" path (the Apple/Google DULT standard; the AirGuard anti-stalking
+# app connects and triggers it the same way). We connect and write the sound trigger so a
+# planted/following tag chirps and you can physically find it. This is ACTIVE and intrusive -
+# it opens a connection, transmits, may surface a hint on the tag, and contends with blue5 for
+# the radio - so it is gated on the master activeFp switch, exactly like the GATT probe.
+# Only tags in the SEPARATED state are connectable to a non-owner, so only those can be rung.
+# Byte rules from the AirGuard app (github.com/seemoo-lab/AirGuard):
+#   AirTag : service 7DFC9000-7D1C-4951-86AA-8D9728F8D66C,
+#            characteristic 7DFC9001-7D1C-4951-86AA-8D9728F8D66C, write one byte 0xAF, no handshake.
+# DULT / third-party Find My / Pebblebee use a notify + timed-stop handshake that gatttool's
+# one-shot mode can't drive cleanly; those are recognised but not yet wired to ring here.
+ringAirTag() {   # mac -> 0 on success; discover the sound-char value handle, then write 0xAF
+    local mac="$1" line vh
+    # AirTags use a random advertising address; try random first, then public as a fallback.
+    line=$(timeout 12 gatttool -b "$mac" -t random --characteristics 2>/dev/null \
+           | grep -i '7dfc9001-7d1c-4951-86aa-8d9728f8d66c' | head -1)
+    [ -n "$line" ] || line=$(timeout 12 gatttool -b "$mac" --characteristics 2>/dev/null \
+           | grep -i '7dfc9001-7d1c-4951-86aa-8d9728f8d66c' | head -1)
+    vh=$(printf '%s' "$line" | sed -n 's/.*char value handle = \(0x[0-9a-fA-F]*\).*/\1/p')
+    [ -n "$vh" ] || return 1
+    timeout 10 gatttool -b "$mac" -t random --char-write-req -a "$vh" -n af 2>/dev/null | grep -qi 'written successfully' && return 0
+    timeout 10 gatttool -b "$mac" --char-write-req -a "$vh" -n af 2>/dev/null | grep -qi 'written successfully' && return 0
+    return 1
+}
+# --- shared interactive-GATT helpers for the handshake-based tag actions --------------------
+# The device has no expect/python, so we drive `gatttool -I` by feeding it timed commands on
+# stdin (sleeps pace connect -> enable-indications -> write -> listen -> disconnect). This is
+# inherently fragile and is UNTESTED against real DULT / third-party Find My / Pebblebee tags
+# (none were in view to validate on) - experimental, and gated behind activeFp like all active work.
+
+# Resolve a characteristic's value handle + its CCCD (0x2902) handle for a UUID (one connection).
+# Prints "<valueHandle> <cccdHandle>" (cccd empty if the characteristic has none).
+gattHandles() {   # mac uuid(lowercase, full 128-bit)
+    timeout 15 gatttool -b "$1" -t random --char-desc 2>/dev/null | awk -v U="$2" '
+        { h=""; if(match($0,/0x[0-9a-fA-F]+/)) h=substr($0,RSTART,RLENGTH)
+          u=""; if(match(tolower($0),/uuid[ :=]+[0-9a-f-]+/)){ u=substr(tolower($0),RSTART,RLENGTH); sub(/.*[ :=]/,"",u) } }
+        u==U && vh=="" { vh=h; found=1; next }
+        found && cc=="" && u ~ /^0000?2902/ { cc=h }
+        END{ print vh" "cc }'
+}
+
+# One interactive gatttool session: connect, optionally enable CCCD indications, write <value> to
+# the value handle, listen for an indication/notification, disconnect. Echoes gatttool output.
+gattSession() {   # mac valueHandle cccdHandle valueHex [listenSecs]
+    local mac="$1" vh="$2" cc="$3" val="$4" listen="${5:-6}"
+    { printf 'connect\n'; sleep 3
+      [ -n "$cc" ] && { printf 'char-write-req %s 0200\n' "$cc"; sleep 1; }
+      printf 'char-write-req %s %s\n' "$vh" "$val"; sleep "$listen"
+      printf 'disconnect\nexit\n'
+    } | timeout $((listen + 12)) gatttool -b "$mac" -t random -I 2>&1
+}
+
+# DIS read for a tag (random address). uuid16 -> printable ASCII value.
+gattReadTag() {   # mac uuid16
+    timeout 8 gatttool -b "$1" -t random --char-read -u "0x$2" 2>/dev/null \
+      | sed -n 's/.*value: *//p' | head -1 \
+      | awk 'function hx(c){return index("0123456789abcdef",tolower(c))-1}
+             {v=""; for(i=1;i<=NF;i++){c=hx(substr($i,1,1))*16+hx(substr($i,2,1)); if(c>=32&&c<127)v=v sprintf("%c",c)} print v}'
+}
+
+activeOffMsg() { PROMPT "ACTIVE mode is OFF (passive-only).
+Enable it from the menu (Active mode) to connect to the tag.
+(ACTIVE: connects to the tag, transmits, and contends with blue5.)"; }
+
+# #3 - ring/page the selected tag. AirTag = one-byte 0xAF (no handshake). DULT / third-party Find
+# My / Pebblebee = write the start opcode to their non-owner characteristic via the indication
+# handshake (experimental). Tile/Chipolo/SmartTag expose no non-owner sound service (per AirGuard).
+ringSelected() {   # mac lbl
+    local mac="$1" lbl="$2" char val vh cc out
+    LED AMBER; LOG yellow "ACTIVE: ringing $mac ($lbl) - intrusive..."
+    case "$lbl" in
+        *AirTag*)
+            if ringAirTag "$mac"; then
+                LOG green "Sound triggered on $mac - listen for the tag."
+                PROMPT "Ring sent to $mac ($lbl).
+If it is separated from its owner it should be chirping now.
+(Silence = owner nearby, out of range, or it refused the connection.)"
+            else
+                LOG red "Could not ring $mac."
+                PROMPT "Couldn't ring $mac. Tags ring only while SEPARATED from their owner;
+it may be near its owner, out of range, or blue5 is holding the radio."
+            fi
+            LED BLUE; return ;;
+        *FindMy*)    char="4f860003-943b-49ef-bed4-2f730304427a"; val="010003" ;;  # AirGuard fd44 path
+        *DULT*)      char="8e0c0001-1d68-fb92-bf61-48377421680e"; val="0003"   ;;  # DULT Sound_Start 0x0300 (LE)
+        *Pebblebee*) char="00002c02-0000-1000-8000-00805f9b34fb"; val="01"     ;;  # AirGuard Pebblebee
+        *) PROMPT "Ringing isn't available for '$lbl'.
+(Tile, Chipolo and Samsung SmartTag expose no non-owner sound service.)"; LED BLUE; return ;;
+    esac
+    set -- $(gattHandles "$mac" "$char"); vh="$1"; cc="$2"
+    if [ -z "$vh" ]; then
+        PROMPT "No non-owner sound characteristic for '$lbl' found on $mac.
+It may not implement that profile, or is not connectable (near its owner / out of range)."
+        LED BLUE; return
+    fi
+    out=$(gattSession "$mac" "$vh" "$cc" "$val" 7)
+    if printf '%s' "$out" | grep -qi 'written successfully\|Indication\|Notification'; then
+        LOG green "Sound command sent to $mac."
+        PROMPT "Sound command sent to $mac ($lbl).
+EXPERIMENTAL (untested against a real $lbl). If it is separated it should chirp (~5-30 s)."
+    else
+        LOG red "Ring failed on $mac."
+        PROMPT "Ring failed on $mac - no write/indication confirmation.
+It may be near its owner, out of range, not implement non-owner sound, or blue5 holds the radio."
+    fi
+    LED BLUE
+}
+
+# #1 - read a tag's identity. DIS (manufacturer/model/firmware) is a plain read; the DULT
+# non-owner accessory info (model/category/battery) uses the opcode+indication handshake and is
+# experimental. NOTE: a non-owner CANNOT read the serial - DULT gates it behind a physical 10 s
+# button hold and returns only an encrypted identifier.
+readTagInfoDult() {   # mac -> decoded lines (or empty)
+    local mac="$1" vh cc out
+    set -- $(gattHandles "$mac" "8e0c0001-1d68-fb92-bf61-48377421680e"); vh="$1"; cc="$2"
+    [ -z "$vh" ] && return 0
+    out=$({ printf 'connect\n'; sleep 3
+            [ -n "$cc" ] && { printf 'char-write-req %s 0200\n' "$cc"; sleep 1; }
+            printf 'char-write-req %s 0500\n' "$vh"; sleep 2   # Model Name   (resp 0x0805)
+            printf 'char-write-req %s 0600\n' "$vh"; sleep 2   # Accessory Cat (resp 0x0806)
+            printf 'char-write-req %s 0c00\n' "$vh"; sleep 2   # Battery Level (resp 0x080c)
+            printf 'disconnect\nexit\n'
+          } | timeout 30 gatttool -b "$mac" -t random -I 2>&1)
+    printf '%s' "$out" | awk '
+      function hx(c){return index("0123456789abcdef",tolower(c))-1}
+      /value:/ { line=$0; sub(/.*value: */,"",line); n=split(line,b," "); if(n<2) next
+         op=b[2] b[1]; txt=""
+         for(i=3;i<=n;i++){ c=hx(substr(b[i],1,1))*16+hx(substr(b[i],2,1)); if(c>=32&&c<127) txt=txt sprintf("%c",c) }
+         v1=(n>=3)? hx(substr(b[3],1,1))*16+hx(substr(b[3],2,1)) : -1
+         if(op=="0805") printf "Model: %s\n", txt
+         else if(op=="0806") printf "Accessory category: %d\n", v1
+         else if(op=="080c"){ split("Full Medium Low Critical",bn," "); printf "Battery: %s\n", (v1>=0&&v1<=3)?bn[v1+1]:v1 } }'
+}
+readTagInfo() {   # mac lbl
+    local mac="$1" lbl="$2" name man mod fw dult info
+    LED AMBER; LOG yellow "ACTIVE: reading $mac ($lbl) - intrusive..."
+    name=$(gattReadTag "$mac" 2a00); man=$(gattReadTag "$mac" 2a29)
+    mod=$(gattReadTag "$mac" 2a24);  fw=$(gattReadTag "$mac" 2a26)
+    info="== Tag info $mac ==
+$lbl
+Name: ${name:-?}
+Manufacturer: ${man:-?}
+Model: ${mod:-?}
+Firmware: ${fw:-?}"
+    dult=$(readTagInfoDult "$mac")
+    [ -n "$dult" ] && info="$info
+-- DULT non-owner (experimental) --
+$dult"
+    LED BLUE
+    PROMPT "$info
+(No serial: a non-owner can't read it - DULT needs a physical 10 s button hold and returns only
+an encrypted identifier. Blank fields = tag refused the connection / not separated.)"
+}
+
+# #2 - passive proximity "hot/cold" finder for one tag. Reads the tag's latest RSSI from the
+# collector's $obs feed (no connection, fully passive) and shows a getting-warmer/colder meter.
+# Works even on a tag whose speaker was disabled (where Ring can't help). RED stops it.
+bgFinder() {   # mac lbl
+    local mac="$1" lbl="$2" r last="" bar arrow rb lastrb="__" now lastEmit=0
+    while :; do
+        [ -f "$pause" ] && { sleep 0.4; continue; }
+        r=$(awk -F'|' -v M="$mac" '$2==M && $3 ~ /^-[0-9]+$/ {v=$3} END{print v}' "$obs" 2>/dev/null)
+        now=$(date +%s)
+        if [ -n "$r" ]; then
+            bar=$(makeBar "$r"); rb=$(( r / 5 ))
+            if [ -n "$last" ]; then
+                if   [ "$r" -gt "$last" ] 2>/dev/null; then arrow="<<< WARMER (closer)"
+                elif [ "$r" -lt "$last" ] 2>/dev/null; then arrow=">>> colder (farther)"
+                else arrow="= steady"; fi
+            else arrow="(move to compare)"; fi
+            # repaint only when the RSSI bucket changes or once per heartbeat (append-only log)
+            if [ "$rb" != "$lastrb" ] || [ $(( now - lastEmit )) -ge "$heartbeat" ]; then
+                LOG cyan "FIND $lbl  ${mac: -8}   (RED=stop)"
+                LOG "$(printf '%5s dBm  %s  %s' "$r" "$bar" "$arrow")"
+                lastrb="$rb"; lastEmit="$now"
+            fi
+            last="$r"
+        else
+            if [ $(( now - lastEmit )) -ge "$heartbeat" ]; then
+                LOG cyan "FIND $lbl  ${mac: -8}   (RED=stop)"
+                LOG "   -- no recent advert (tag silent / out of range) --"; lastEmit="$now"
+            fi
+        fi
+        sleep 2
+    done
+}
+findTag() {   # mac lbl
+    local mac="$1" lbl="$2" btn fpid
+    rm -f "$pause"
+    LOG cyan "Proximity finder: $lbl  ${mac: -8}   RED = stop"
+    bgFinder "$mac" "$lbl" & fpid=$!
+    while true; do
+        btn=$(WAIT_FOR_INPUT)
+        case "$btn" in B|BACK) kill "$fpid" 2>/dev/null; return;; esac
+    done
+}
+
+# Tag tools hub: pick a tag in view, then act on it (passive Find, or active Ring / Read info).
+tagTools() {
+    local rows=() macs=() lbls=() sig mac src lbl pick i selMac selLbl act
+    while IFS='|' read -r sig mac src lbl; do
+        [ "$src" = "TAG" ] || continue
+        [ -z "$mac" ] && continue
+        macs+=("$mac"); lbls+=("$lbl")
+        rows+=("$(printf '%4s %s %s' "$sig" "${mac: -8}" "${lbl:0:16}")")
+    done < <(liveSnapshotRows)
+    if [ ${#rows[@]} -eq 0 ]; then PROMPT "No tracker tags in view.
+Let the radar run a few seconds so tags appear, then try again."; return; fi
+    while true; do
+        pick=$(LIST_PICKER "Tag tools - pick a tag (RED=back)" "${rows[@]}" "${rows[0]}") || return
+        selMac=""; selLbl=""; i=0
+        while [ $i -lt ${#rows[@]} ]; do [ "${rows[$i]}" = "$pick" ] && { selMac="${macs[$i]}"; selLbl="${lbls[$i]}"; break; }; i=$((i+1)); done
+        [ -n "$selMac" ] || continue
+        while true; do
+            act=$(LIST_PICKER "$selLbl ${selMac: -8}" "Find (proximity, passive)" "Ring (ACTIVE)" "Read info (ACTIVE)" "Back to tag list" "Find (proximity, passive)") || break
+            case "$act" in
+                "Find (proximity, passive)") findTag "$selMac" "$selLbl" ;;
+                "Ring (ACTIVE)")      [ "$activeFp" = true ] && ringSelected "$selMac" "$selLbl" || activeOffMsg ;;
+                "Read info (ACTIVE)") [ "$activeFp" = true ] && readTagInfo "$selMac" "$selLbl" || activeOffMsg ;;
+                "Back to tag list")   break ;;
+            esac
+        done
+    done
+}
+
+# ============================================================
 # MENU HUB (pop-up list; shown on launch and when RED pressed in radar)
 # ============================================================
 # LIST_PICKER signature:  LIST_PICKER <title> <opt1> <opt2> ... <optN> <default>
@@ -785,7 +1015,7 @@ enableActive() {
     c=$(LIST_PICKER "Enable ACTIVE mode?" "Yes - connect to devices (ACTIVE)" "No - stay passive" "No - stay passive")
     [ "$c" = "Yes - connect to devices (ACTIVE)" ] || { LOG green "Stayed passive (Stages 1-2 only)."; return; }
     activeFp=true
-    LOG red "ACTIVE mode ON - 'Probe BT device' is now in the menu."
+    LOG red "ACTIVE mode ON - 'Probe BT device' added; Tag tools' Ring/Read info now enabled."
 }
 
 menu() {
@@ -798,15 +1028,16 @@ menu() {
         fi
         # Flat, titled, SCROLLABLE list - scroll down to reach items below the screen.
         if [ -n "$extra" ]; then
-            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "$extra" "Start scan")
+            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Tag tools (find/ring/info)" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "$extra" "Start scan")
         else
-            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "Start scan")
+            choice=$(LIST_PICKER "Main Menu" "Start scan" "Take snapshot" "Compare snapshots" "Tag tools (find/ring/info)" "Learn known here" "Clear saved data" "Stop & exit" "$modeItem" "Start scan")
         fi
         [ $? -ne 0 ] && continue
         case "$choice" in
             "Start scan")                 radar ;;
             "Take snapshot")              snapshotAndClear ;;
             "Compare snapshots")          doCompare ;;
+            "Tag tools (find/ring/info)") tagTools ;;
             "Learn known here")           learnKnown ;;
             "Clear saved data")           clearHistory ;;
             "Active mode: OFF (enable)")  enableActive ;;
@@ -867,6 +1098,36 @@ function normmac(s,  u){
      return substr(u,1,2)":"substr(u,3,2)":"substr(u,5,2)":"substr(u,7,2)":"substr(u,9,2)":"substr(u,11,2)
   return ""
 }
+# --- tracker-tag detector (radar "T" label only) -----------------------------------------
+# KEEP IN SYNC with tracker()/sdata()/has16()/hb() in $snapAwk - these are the identical
+# AirGuard byte rules, duplicated here so the live collector can tag trackers "T" without a
+# per-frame sqlite+awk decode (that would re-introduce the render sluggishness we fixed). The
+# authoritative decode for the Compare report still lives in $snapAwk; this is a display hint.
+function hb(s,  a,bb){ a=index("0123456789ABCDEF",substr(s,1,1)); bb=index("0123456789ABCDEF",substr(s,2,1))
+  if(a==0||bb==0) return -1; return (a-1)*16+(bb-1) }
+function sdata(svcd,u,  p,n,len,uu){ p=1; n=length(svcd)
+  while(p+5<=n){ len=hb(substr(svcd,p,2)); if(len<1) break
+    if(substr(svcd,p+2,2)=="16" && len>=3){ uu=substr(svcd,p+6,2) substr(svcd,p+4,2)
+      if(uu==u) return substr(svcd,p+8,(len-3)*2) }
+    p=p+2+len*2 }
+  return "NONE" }
+function has16(svc16,u){ return index("," svc16 ",", "," u ",")>0 }
+function tracker(mfr,svcd,svc16,  ln,st,dt,sep,d,b0){
+  if(substr(mfr,1,6)=="4C0012" && length(mfr)>=10){
+    ln=substr(mfr,7,2); st=hb(substr(mfr,9,2)); if(st<0) return ""
+    dt=int(st/16)%4; sep=(ln=="19")
+    if(dt==1) return "AirTag" (sep?" [separated]":"")
+    if(dt==2) return "FindMy-tag" (sep?" [separated]":"")
+    return "" }
+  d=sdata(svcd,"FD5A"); if(d!="NONE"){ b0=hb(substr(d,1,2)); if(b0>=0 && int(b0/8)==2) return "SmartTag" }
+  d=sdata(svcd,"FEED"); if(substr(d,1,4)=="0200") return "Tile"
+  if(has16(svc16,"FE33")) return "Chipolo"
+  if(has16(svc16,"FA25") || sdata(svcd,"FA25")!="NONE") return "Pebblebee"
+  d=sdata(svcd,"FEAA")
+  if(substr(d,1,2)=="40") return "Google-FMDN"
+  if(substr(d,1,2)=="41") return "Google-FMDN [separated]"
+  if(sdata(svcd,"FCB2")!="NONE") return "DULT-tag"
+  return "" }
 BEGIN{
   while((getline L < OUIFILE) > 0){
      n=split(L,a,/[ \t]+/); if(n<2) continue
@@ -893,7 +1154,9 @@ $1=="FLUSH"{
   next
 }
 $1=="W"{ m=normmac($3); if(m==""){next} v=oui[substr(m,1,8)]; s=($4==""?"-99":$4); print $2"|"m"|"s"|WIFI|"v"|||"$5 >> OBS; lc++; next }
-$1=="B"{ m=normmac($3); if(m==""){next} v=oui[substr(m,1,8)]; s=($4==""?"-99":$4); co=($5 in comp)?comp[$5]:""; nm=$6; gsub(/\|/,"",nm); print $2"|"m"|"s"|BLE|"v"|"co"|"nm"|" >> OBS; lc++; next }
+$1=="B"{ m=normmac($3); if(m==""){next} v=oui[substr(m,1,8)]; s=($4==""?"-99":$4); co=($5 in comp)?comp[$5]:""; nm=$6; gsub(/\|/,"",nm);
+  tg=tracker(toupper($7),toupper($8),toupper($9));    # field 9 = tracker type (empty if not a tag) -> radar "T"
+  print $2"|"m"|"s"|BLE|"v"|"co"|"nm"||"tg >> OBS; lc++; next }
 AWKEOF
 
 # Stage 2 IE-fingerprint parser: reconstruct each probe-request frame from tcpdump -xx,

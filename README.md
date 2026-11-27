@@ -12,7 +12,7 @@ collect and passively sniffs the air. It does not transmit to or connect to any 
 device unless you explicitly enable active mode (see [Passive vs. active](#passive-vs-active)).
 It takes up to 10 seconds to start populating identifiers.
 
-> **Version:** `v20261124-rc1` (release candidate)
+> **Version:** `v20261126-rc2` (release candidate)
 
 ---
 
@@ -52,9 +52,21 @@ as groundwork for AntiHunter.
 - **Compare** — correlates identities across all snapshots and flags the devices that keep
   reappearing (the same device recurring across snapshots), plus low-confidence cross-radio (Wi-Fi↔BT) pairings.
 - **Tracker tags** — recognises AirTags, Find My accessories, Samsung SmartTags, Tile, Chipolo,
-  Pebblebee, Google Find My Device tags and any tag using the Apple/Google tracker standard, and lists
-  the ones that recur across snapshots (tags away from their owner first). Rules follow the AirGuard
-  research app.
+  Pebblebee, Google Find My Device tags and any tag using the Apple/Google tracker standard. They
+  are flagged live on the radar with a **`T`** (instead of `B`) and labelled with the tag type, and
+  Compare lists the ones that recur across snapshots (tags away from their owner first). Rules follow
+  the AirGuard research app.
+- **Tag tools** — pick a tracker in view and act on it:
+  - **Find (proximity)** — *passive.* A getting-warmer/colder RSSI meter to physically walk a tag
+    down; works even on a tag whose speaker has been disabled, where ringing can't help.
+  - **Ring** *(active, opt-in)* — for a tag **separated from its owner** (the state a planted tag is
+    in), connect and trigger its non-owner "play sound" so it chirps — the anti-stalking action the
+    AirGuard app performs. AirTags are supported; DULT / third-party Find My / Pebblebee are attempted
+    experimentally. (Tile, Chipolo and SmartTag expose no non-owner sound and can't be rung.)
+  - **Read info** *(active, opt-in)* — reads the tag's GATT device info (and, experimentally, DULT
+    accessory info). The **serial number is not obtainable** as a non-owner — DULT gates it behind a
+    physical button hold and returns only an encrypted identifier.
+  The active actions are intrusive and stay behind the `activeFp` switch.
 - **Dwell & history** — Compare shows how long each identity was present this session (dwell) and
   how many sessions it has been seen across (cross-session memory, auto-expiring after `histDays`).
 - **Known-device filtering** — mark your own/authorised devices (one menu press captures everything
@@ -115,9 +127,10 @@ activeFp=false   # default: PASSIVE fingerprinting only
 
 - `activeFp=false` (default): Stages 1–2 only. The tool only reads databases and passively
   listens. It does not transmit to or connect to any device. The Stage 3 probe item is hidden.
-- `activeFp=true`: unlocks active techniques (today: the Stage 3 GATT probe; the same flag will
-  gate any future active module). Active techniques connect to / transmit at a nearby device, may
-  alert it, and contend with the Bluetooth daemon.
+- `activeFp=true`: unlocks active techniques (today: the Stage 3 GATT probe, and Tag tools' **Ring**
+  and **Read info**; the same flag gates any future active module). Active techniques connect to /
+  transmit at a nearby device, may alert it, and contend with the Bluetooth daemon. (Tag tools'
+  **Find** proximity meter is passive and works without active mode.)
 
 The launch banner shows the mode you start in, and the menu's `Active mode:` item shows the
 current state.

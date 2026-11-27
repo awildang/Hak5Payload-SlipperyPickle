@@ -3,6 +3,54 @@
 All notable changes to this project are documented here. Versions use a date-stamped scheme:
 `vYYYYMMDD`, with `-rcN` for release candidates.
 
+## v20261126-rc2 — 2026-11-26
+
+### Added — tag interaction suite ("Tag tools")
+The menu's tracker actions are consolidated into one **Tag tools** item: pick a tag in view, then
+act on it. Three actions:
+
+- **Find (proximity)** — *passive.* A getting-warmer/colder RSSI meter for one tag, read from the
+  existing passive collector feed (no connection). Helps you physically walk down a tag — and works
+  even on a tag whose speaker has been disabled, where ringing can't help. Always available.
+- **Ring (ACTIVE)** — now covers more families. AirTag (one-byte `0xAF`, no handshake) is as before;
+  **DULT**, third-party **Find My** and **Pebblebee** tags are now attempted via their non-owner
+  sound characteristic using an indication handshake (`gatttool -I` driven over stdin). *Experimental
+  and untested against those families* (none were available to validate); gated behind `activeFp`.
+- **Read info (ACTIVE)** — reads the tag's GATT Device Information (manufacturer / model / firmware)
+  and, experimentally, DULT non-owner accessory info (model / accessory category / battery) via the
+  opcode+indication handshake. Gated behind `activeFp`.
+
+### Notes
+- **Serial number is intentionally not read.** As a non-owner it is not obtainable over BLE: the
+  Apple/Google DULT spec gates the identifier behind a physical ~10 s button hold on the tag and
+  returns only an *encrypted* identifier. Documented in `docs/PAPERS.md`.
+- Ringing remains impossible for Tile, Chipolo and Samsung SmartTag — they expose no non-owner
+  sound service (per the AirGuard analysis).
+
+## v20261126-rc1 — 2026-11-26
+
+### Added
+- **Tracker tags shown live on the radar.** The live list now decodes tracker adverts in the
+  collector and marks a tag with a **`T`** radio flag (instead of `B`), labelled with the tag
+  type (`AirTag`, `SmartTag`, …). Non-tag Bluetooth devices stay `B`. The decode reuses the
+  same AirGuard byte rules as Compare, run once per collector pass (not per frame) so the radar
+  stays responsive.
+- **Ring / page a tracker tag** (active, opt-in) — a new **Ring a tag (ACTIVE!)** menu item
+  (visible only when `activeFp=true`) lists the tags currently in view and, for an AirTag,
+  connects and triggers its non-owner "play sound" characteristic so a planted/following tag
+  chirps and you can physically find it. Sound-write sequence follows the AirGuard app
+  (service `7DFC9000-…`, characteristic `7DFC9001-…`, write byte `0xAF`). Only tags **separated
+  from their owner** are connectable to a non-owner, so only those can be rung. Third-party
+  Find My / DULT / Pebblebee tags are recognised but use a notify-handshake sound protocol not
+  yet wired up. Like the GATT probe, this is intrusive and gated behind `activeFp`.
+
+### Documentation
+- **PAPERS.md — Find My / Offline Finding exploit literature.** Added a section citing the
+  foundational OF reverse-engineering (*Who Can Find My Devices?*, PoPETs 2021 + OpenHaystack), the
+  AirTag firmware/hardware exploit (*AirTag of the Clones*, WOOT 2022 — the firmware basis for the
+  ring feature), safety-alert evasion (*Track You*, PoPETs 2023), the evasion arms race (PRIVACYSHIELD,
+  USENIX '26 pre-print; cross-brand study arXiv:2312.07157), and the Find My covert channel (*Send My*).
+
 ## v20261124-rc1 — 2026-11-24
 
 First public release candidate.

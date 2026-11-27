@@ -42,6 +42,7 @@ The menu is a single scrollable list titled **Main Menu**. If the list is taller
 | Start scan | Open the live radar (continuously refreshing device list). |
 | Take snapshot | Freeze and enrich the current device set, then clear the list. |
 | Compare snapshots | Correlate identities across all snapshots and produce the report. |
+| Tag tools (find/ring/info) | Pick a tracker tag in view, then: **Find** (passive proximity meter), **Ring** (active — make it chirp), or **Read info** (active — read its GATT/DULT info). See *Tag tools* below. |
 | Learn known here | Add every device currently around you to the known/authorised list, so they are hidden from Compare. No MAC typing. |
 | Clear saved data | Wipe the cross-session history or the known-devices list (pick which). |
 | Stop & exit | Clean up and quit. |
@@ -49,7 +50,9 @@ The menu is a single scrollable list titled **Main Menu**. If the list is taller
 | Probe BT device (ACTIVE!) | *Only shown while active mode is ON* — Stage 3 GATT probe. |
 
 In the live radar: the back control returns to the menu; the select control opens the **device
-detail** view for a highlighted device.
+detail** view for a highlighted device. Each row's radio flag is **`W`** (Wi-Fi), **`B`**
+(Bluetooth), or **`T`** (a Bluetooth tracker tag — AirTag, SmartTag, …), with the tag type shown
+as its label.
 
 ## A typical run
 
@@ -92,12 +95,33 @@ Select a device in the radar to see its identifiers:
 - probed-SSID list (PNL)
 - DHCP hostname (if the device is on your access point)
 
-## Stage 3 (active) — if you enable it
+## Tag tools
 
-With `activeFp=true`, the "Probe BT device (ACTIVE!)" menu item appears. It connects to one BLE
-device you select and reads its GATT information and service UUIDs. This is intrusive: it opens a
-connection to that device, may be noticeable to it, and contends with the Bluetooth daemon. That is
-why it stays off behind the `activeFp` switch.
+Pick **Tag tools** from the menu to see the tracker tags currently in view, choose one, then pick
+an action:
+
+- **Find (proximity)** — *passive, always available.* Shows a live getting-warmer/colder RSSI meter
+  for that one tag, read from the passive feed (no connection). Walk around: `<<< WARMER` means you
+  are getting closer, `>>> colder` farther. This works **even on a tag whose speaker was disabled**,
+  where ringing it would do nothing. Press the back control to stop.
+- **Ring** — *active (needs `activeFp=true`).* For a tag **separated from its owner**, connects and
+  triggers its non-owner "play sound" so it chirps. Only separated tags are connectable to a
+  non-owner, so a tag near its owner (or out of range) will not ring. AirTags are supported; **DULT,
+  third-party Find My and Pebblebee are attempted but experimental/untested**; Tile, Chipolo and
+  Samsung SmartTag cannot be rung (no non-owner sound service).
+- **Read info** — *active (needs `activeFp=true`).* Reads the tag's GATT device info (manufacturer /
+  model / firmware) and, experimentally, DULT non-owner accessory info (model / category / battery).
+  The **serial number is not obtainable** as a non-owner — DULT requires a physical ~10-second button
+  hold on the tag and returns only an encrypted identifier.
+
+## Stage 3 (active) — the GATT probe
+
+With `activeFp=true`, **Probe BT device (ACTIVE!)** appears: it connects to one BLE device you select
+and reads its GATT device information and service UUIDs.
+
+Active actions (the probe, and Tag tools' Ring / Read info) are intrusive: they open a connection to
+the device, may be noticeable to it, and contend with the Bluetooth daemon. That is why they stay off
+behind the `activeFp` switch. Tag tools' **Find** is passive and needs no active mode.
 
 ## Tuning
 

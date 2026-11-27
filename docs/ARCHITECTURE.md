@@ -94,6 +94,27 @@ service UUIDs (a GATT-profile fingerprint). This is **active and intrusive**: it
 to that device, may surface a connection hint on it, and contends with the Bluetooth daemon. That is
 why it stays off behind the `activeFp` switch.
 
+## Tag tools (tracker interaction)
+
+The **Tag tools** menu lists the tracker tags in view and offers three per-tag actions. Only the
+last two are active (behind `activeFp`); the first is passive:
+
+- **Find (proximity)** — passive. Reads the selected tag's latest RSSI from the collector's `$obs`
+  feed (no connection) and renders a getting-warmer/colder meter so the tag can be walked down —
+  including a tag whose speaker was physically disabled, where ringing does nothing.
+- **Ring** — active. For a tag **separated from its owner**, connects and writes the non-owner
+  "play sound" command so the tag chirps (the anti-stalking action AirGuard performs). AirTag:
+  service `7DFC9000-…`, characteristic `7DFC9001-…`, write `0xAF` (no handshake). DULT / third-party
+  Find My / Pebblebee use their non-owner characteristic via an indication handshake driven through
+  `gatttool -I` — **experimental and untested** against those families. Tile / Chipolo / SmartTag
+  expose no non-owner sound service and cannot be rung. Only separated tags are connectable to a
+  non-owner.
+- **Read info** — active. Reads GATT Device Information (manufacturer / model / firmware) and,
+  experimentally, DULT non-owner accessory info (model / accessory category / battery) via the
+  opcode+indication handshake on the DULT characteristic `8E0C0001-…`. The serial number is **not**
+  readable by a non-owner: DULT (`Get_Identifier`, opcode `0x0404`) requires a physical ~10-second
+  button hold on the tag to enter "identifier read state" and returns only an encrypted identifier.
+
 ---
 
 ## Correlation engine (the "Compare" step)
